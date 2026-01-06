@@ -282,6 +282,72 @@ hashtree-ci integrates with [hashtree-ts](https://github.com/mmalmi/hashtree-ts)
 4. Displays status badge (✓ success / ✗ failure / ⏳ pending)
 ```
 
+## Deployment
+
+### Recommended: LXD + Podman
+
+For secure CI execution, run `htci` inside an LXD system container with Podman for job isolation:
+
+```
+Your Host (safe)
+└── LXD container "ci-runner" (isolated from host)
+    └── htci
+        └── podman run job1  ← isolated per job
+        └── podman run job2  ← isolated per job
+```
+
+**Why two layers?**
+- **LXD** isolates the CI system from your host
+- **Podman** isolates each job from each other (and runs OCI/Docker images)
+
+### LXD Setup
+
+```bash
+# Install LXD
+sudo snap install lxd
+lxd init --auto
+
+# Create CI runner container
+lxc launch ubuntu:22.04 ci-runner
+
+# Install podman and htci inside
+lxc exec ci-runner -- bash -c "
+  apt update
+  apt install -y podman
+  # Install htci (cargo install or download binary)
+"
+
+# Configure runner
+lxc exec ci-runner -- htci init --name my-runner --tags linux --container
+```
+
+### Share Repos with LXD
+
+```bash
+# Mount repos folder from host
+lxc config device add ci-runner repos disk source=/home/you/repos path=/repos
+
+# Run CI on a repo
+lxc exec ci-runner -- htci run --repo /repos/myproject
+```
+
+### Start on Boot
+
+```bash
+# Auto-start the CI runner container
+lxc config set ci-runner boot.autostart true
+```
+
+### Why Not Vagrant?
+
+| | LXD | Vagrant |
+|---|-----|---------|
+| Startup | ~2-3 seconds | ~30-60 seconds |
+| RAM overhead | ~50MB | ~512MB+ |
+| Type | System container | Full VM |
+
+LXD is lighter and faster. Use Vagrant only if you need Windows/macOS host support.
+
 ## Security
 
 ### Container Isolation
