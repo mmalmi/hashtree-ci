@@ -172,7 +172,7 @@ fn default_image() -> String {
 }
 
 fn default_network() -> String {
-    "none".to_string()
+    "bridge".to_string()  // Isolated but has internet access for package downloads
 }
 
 fn default_true() -> bool {

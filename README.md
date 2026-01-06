@@ -201,9 +201,9 @@ max_artifact_size = 1073741824  # 1GB
 # Container isolation (recommended for security)
 [runner.container]
 enabled = true
-runtime = "docker"  # or "podman"
+runtime = "podman"  # or "docker"
 default_image = "ubuntu:22.04"
-network = "none"    # "none", "host", or "bridge"
+network = "bridge"  # "bridge" (default), "none", or "host"
 memory_limit = "2g"
 cpu_limit = "2"
 rootless = true
@@ -289,17 +289,64 @@ hashtree-ci integrates with [hashtree-ts](https://github.com/mmalmi/hashtree-ts)
 **Strongly recommended**: Enable container isolation to prevent CI jobs from accessing your host system.
 
 ```bash
-# Initialize with container support
+# Initialize with container support (prefers podman for rootless security)
 htci init --name my-runner --tags linux --container
 ```
 
 When container mode is enabled:
 - Jobs run inside Docker/Podman containers
-- Network is disabled by default (`--network=none`)
+- Network is bridged (internet access for package downloads)
 - Filesystem is read-only except `/workspace` and `/tmp`
 - Runs as non-root user (uid 1000)
 - All capabilities dropped (`--cap-drop=ALL`)
 - No new privileges (`--security-opt=no-new-privileges`)
+
+### Podman vs Docker
+
+**Podman rootless is recommended** for maximum security:
+
+| | Docker | Podman (rootless) |
+|---|--------|-------------------|
+| Daemon | Root daemon | No daemon |
+| Container escape | → root on host | → your user only |
+
+```bash
+# Install podman
+sudo apt install podman  # Debian/Ubuntu
+brew install podman      # macOS
+
+# htci auto-detects and prefers podman
+htci init --name my-runner --tags linux --container
+```
+
+### Running CI Runner in a Container (Nested)
+
+You can run the CI runner itself in a container with Podman-in-Podman:
+
+```bash
+# Outer container needs user namespace support
+podman run -it --rm \
+  --userns=keep-id \
+  --security-opt seccomp=unconfined \
+  -v ./my-repos:/repos:Z \
+  ubuntu:22.04 bash
+
+# Inside: install podman and htci, then run CI
+apt update && apt install -y podman
+htci init --name nested-runner --tags linux --container
+htci run --repo /repos/myproject
+```
+
+### Network Modes
+
+Configure network isolation level in `runner.toml`:
+
+```toml
+[runner.container]
+network = "bridge"  # Default: internet access for npm/cargo/etc
+# network = "none"  # Maximum isolation: no network at all
+# network = "host"  # No isolation: shares host network (not recommended)
+```
 
 ### Allowed Repos
 

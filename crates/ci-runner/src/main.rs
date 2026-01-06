@@ -103,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
                     enabled: true,
                     runtime,
                     default_image: image,
-                    network: "none".to_string(),
+                    network: "bridge".to_string(),  // Internet access for package downloads
                     volumes: Vec::new(),
                     memory_limit: Some("2g".to_string()),
                     cpu_limit: Some("2".to_string()),
