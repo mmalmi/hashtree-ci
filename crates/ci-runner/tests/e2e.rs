@@ -437,9 +437,141 @@ async fn test_ci_execution_with_failure() {
     assert_eq!(result.steps[1].exit_code, Some(42));
 }
 
+/// E2E test: run CI job inside a container (podman/docker)
+/// Skips if no container runtime is available
+#[tokio::test]
+async fn test_ci_execution_in_container() {
+    // 1. Check if container runtime is available
+    let runtime = detect_container_runtime().await;
+    if runtime.is_none() {
+        eprintln!("Skipping container test: no docker/podman available");
+        return;
+    }
+    let runtime = runtime.unwrap();
+    eprintln!("Using container runtime: {}", runtime);
+
+    // 2. Create temp repo with a workflow
+    let repo_dir = tempdir().unwrap();
+    let workflows_dir = repo_dir.path().join(".github/workflows");
+    std::fs::create_dir_all(&workflows_dir).unwrap();
+
+    // Workflow that tests container isolation
+    let workflow_yaml = r#"
+name: Container Test
+on: push
+jobs:
+  test:
+    runs-on: linux
+    steps:
+      - name: Check we're in container
+        run: |
+          echo "Running in container!"
+          cat /etc/os-release | head -2
+      - name: Test network (should work with bridge)
+        run: |
+          # Just check DNS works, don't actually download
+          cat /etc/resolv.conf || true
+      - name: Test filesystem isolation
+        run: |
+          # Should be able to write to /workspace
+          echo "test" > /workspace/testfile.txt
+          cat /workspace/testfile.txt
+      - name: Verify no root
+        run: |
+          id
+          whoami || echo "whoami not available"
+"#;
+    std::fs::write(workflows_dir.join("ci.yml"), workflow_yaml).unwrap();
+
+    // 3. Create a file in repo to verify it's mounted
+    std::fs::write(repo_dir.path().join("README.md"), "# Test Repo").unwrap();
+
+    // 4. Create runner and container config
+    let runner = RunnerIdentity::generate("container-test".to_string(), vec!["linux".to_string()]);
+    let container_config = ci_core::ContainerConfig {
+        enabled: true,
+        runtime,
+        default_image: "ubuntu:22.04".to_string(),
+        network: "bridge".to_string(),
+        volumes: Vec::new(),
+        memory_limit: Some("512m".to_string()),
+        cpu_limit: Some("1".to_string()),
+        rootless: true,
+    };
+
+    // 5. Parse workflow and create job
+    let workflow = parse_workflow(workflow_yaml).unwrap();
+    let jobs = workflow_to_jobs(
+        &workflow,
+        "npub1owner/repos/containertest",
+        "container123",
+        ".github/workflows/ci.yml",
+    );
+
+    assert_eq!(jobs.len(), 1);
+    let job = &jobs[0];
+
+    // 6. Execute in container
+    let result = ci_runner_executor::execute_job_with_container(
+        job,
+        &runner,
+        repo_dir.path(),
+        &container_config,
+    ).await.unwrap();
+
+    // 7. Verify success
+    eprintln!("Job status: {:?}", result.status);
+    for step in &result.steps {
+        eprintln!("  Step '{}': {:?} (exit: {:?})", step.name, step.status, step.exit_code);
+        if let Some(ref err) = step.error {
+            eprintln!("    Error: {}", err);
+        }
+    }
+
+    assert_eq!(result.status, JobStatus::Success, "Container job should succeed");
+    assert!(result.steps.iter().all(|s| s.status == JobStatus::Success));
+    assert!(result.verify().unwrap());
+}
+
+/// Detect available container runtime by actually trying to run a container
+async fn detect_container_runtime() -> Option<String> {
+    use tokio::process::Command;
+    use std::process::Stdio;
+
+    // Prefer podman for rootless security
+    for runtime in &["podman", "docker"] {
+        // First check if command exists
+        let version_check = Command::new(runtime)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+
+        if !version_check.map(|s| s.success()).unwrap_or(false) {
+            continue;
+        }
+
+        // Actually try to run a container - this catches cases where
+        // the binary exists but can't run containers (e.g., nested containers
+        // without proper permissions)
+        let run_check = Command::new(runtime)
+            .args(["run", "--rm", "alpine", "echo", "test"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+
+        if run_check.map(|s| s.success()).unwrap_or(false) {
+            return Some(runtime.to_string());
+        }
+    }
+    None
+}
+
 // Wrapper module to access the executor from tests
 mod ci_runner_executor {
-    use ci_core::{Job, JobResult, JobStatus, RunnerIdentity, StepAction, StepResult};
+    use ci_core::{ContainerConfig, Job, JobResult, JobStatus, RunnerIdentity, StepAction, StepResult};
     use chrono::Utc;
     use sha2::Digest;
     use std::path::Path;
@@ -562,6 +694,170 @@ mod ci_runner_executor {
 
         let error = if !output.status.success() {
             Some(format!("Exit code: {:?}", exit_code))
+        } else {
+            None
+        };
+
+        (status, exit_code, logs, error)
+    }
+
+    pub async fn execute_job_with_container(
+        job: &Job,
+        runner: &RunnerIdentity,
+        work_dir: &Path,
+        container_config: &ContainerConfig,
+    ) -> anyhow::Result<JobResult> {
+        let mut result = JobResult::new(
+            job.id,
+            runner.npub(),
+            job.repo_hash.clone(),
+            job.commit.clone(),
+            job.workflow.clone(),
+            job.job_name.clone(),
+        );
+
+        let mut all_logs = Vec::new();
+        let mut job_failed = false;
+
+        for step in &job.steps {
+            let step_start = std::time::Instant::now();
+
+            let (status, exit_code, logs, error) = match &step.action {
+                StepAction::Run(cmd) => {
+                    if container_config.enabled {
+                        execute_container_step(cmd, work_dir, &job.env, container_config).await
+                    } else {
+                        execute_shell_step(cmd, work_dir, &job.env).await
+                    }
+                }
+                StepAction::Uses { action, with: _ } => {
+                    let msg = format!("Action '{}' not yet supported", action);
+                    (JobStatus::Skipped, None, msg.as_bytes().to_vec(), Some(msg))
+                }
+            };
+
+            let duration = step_start.elapsed().as_secs();
+            let logs_hash = hex::encode(sha2::Sha256::digest(&logs));
+            all_logs.extend_from_slice(&logs);
+            all_logs.push(b'\n');
+
+            let step_result = StepResult {
+                name: step.name.clone(),
+                status,
+                exit_code,
+                duration_secs: duration,
+                logs_hash,
+                error,
+            };
+
+            result.steps.push(step_result);
+
+            if status == JobStatus::Failure && !step.continue_on_error {
+                job_failed = true;
+                break;
+            }
+        }
+
+        result.status = if job_failed {
+            JobStatus::Failure
+        } else {
+            JobStatus::Success
+        };
+
+        result.finished_at = Utc::now();
+        result.logs_hash = hex::encode(sha2::Sha256::digest(&all_logs));
+        result.sign(&runner.nsec())?;
+
+        Ok(result)
+    }
+
+    async fn execute_container_step(
+        cmd: &str,
+        work_dir: &Path,
+        env: &std::collections::HashMap<String, String>,
+        config: &ContainerConfig,
+    ) -> (JobStatus, Option<i32>, Vec<u8>, Option<String>) {
+        let mut logs = Vec::new();
+        logs.extend_from_slice(format!("$ {} (in container: {})\n", cmd, config.default_image).as_bytes());
+
+        let mut command = Command::new(&config.runtime);
+        command.arg("run").arg("--rm");
+
+        // Network
+        match config.network.as_str() {
+            "none" => { command.arg("--network=none"); }
+            "host" => { command.arg("--network=host"); }
+            _ => { /* bridge is default */ }
+        }
+
+        // Resource limits
+        if let Some(ref mem) = config.memory_limit {
+            command.arg(format!("--memory={}", mem));
+        }
+        if let Some(ref cpu) = config.cpu_limit {
+            command.arg(format!("--cpus={}", cpu));
+        }
+
+        // Rootless
+        if config.rootless {
+            command.arg("--user=1000:1000");
+        }
+
+        // Mount work directory
+        let work_dir_abs = work_dir.canonicalize().unwrap_or_else(|_| work_dir.to_path_buf());
+        command.arg("-v").arg(format!("{}:/workspace:rw", work_dir_abs.display()));
+        command.arg("-w").arg("/workspace");
+
+        // Environment
+        for (key, value) in env {
+            command.arg("-e").arg(format!("{}={}", key, value));
+        }
+
+        // Security hardening
+        command.arg("--read-only");
+        command.arg("--tmpfs=/tmp:rw,noexec,nosuid,size=512m");
+        command.arg("--security-opt=no-new-privileges");
+        command.arg("--cap-drop=ALL");
+
+        // Image and command
+        command.arg(&config.default_image);
+        command.arg("sh").arg("-c").arg(cmd);
+
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let child = match command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let error = format!("Failed to spawn container: {}. Is {} installed?", e, config.runtime);
+                logs.extend_from_slice(error.as_bytes());
+                return (JobStatus::Failure, None, logs, Some(error));
+            }
+        };
+
+        let output = match child.wait_with_output().await {
+            Ok(o) => o,
+            Err(e) => {
+                let error = format!("Failed to wait for container: {}", e);
+                logs.extend_from_slice(error.as_bytes());
+                return (JobStatus::Failure, None, logs, Some(error));
+            }
+        };
+
+        logs.extend_from_slice(&output.stdout);
+        if !output.stderr.is_empty() {
+            logs.extend_from_slice(b"\n[stderr]\n");
+            logs.extend_from_slice(&output.stderr);
+        }
+
+        let exit_code = output.status.code();
+        let status = if output.status.success() {
+            JobStatus::Success
+        } else {
+            JobStatus::Failure
+        };
+
+        let error = if !output.status.success() {
+            Some(format!("Container exit code: {:?}", exit_code))
         } else {
             None
         };
