@@ -102,6 +102,116 @@ pub struct RunnerIdentityConfig {
     /// Resource limits
     #[serde(default)]
     pub limits: RunnerLimits,
+
+    /// Container configuration for secure execution
+    #[serde(default)]
+    pub container: ContainerConfig,
+
+    /// Allowed repositories (if empty, only explicit CLI runs are allowed)
+    #[serde(default)]
+    pub allowed_repos: Vec<AllowedRepo>,
+}
+
+/// Container runtime configuration for secure job execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerConfig {
+    /// Enable container isolation
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Container runtime: "docker" or "podman"
+    #[serde(default = "default_runtime")]
+    pub runtime: String,
+
+    /// Default container image (e.g., "ubuntu:22.04", "rust:1.75")
+    #[serde(default = "default_image")]
+    pub default_image: String,
+
+    /// Network mode: "none", "host", or "bridge"
+    #[serde(default = "default_network")]
+    pub network: String,
+
+    /// Additional volume mounts (host:container format)
+    #[serde(default)]
+    pub volumes: Vec<String>,
+
+    /// Memory limit (e.g., "2g", "512m")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_limit: Option<String>,
+
+    /// CPU limit (e.g., "2" for 2 cores)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_limit: Option<String>,
+
+    /// Run as non-root user inside container
+    #[serde(default = "default_true")]
+    pub rootless: bool,
+}
+
+impl Default for ContainerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            runtime: default_runtime(),
+            default_image: default_image(),
+            network: default_network(),
+            volumes: Vec::new(),
+            memory_limit: None,
+            cpu_limit: None,
+            rootless: true,
+        }
+    }
+}
+
+fn default_runtime() -> String {
+    "docker".to_string()
+}
+
+fn default_image() -> String {
+    "ubuntu:22.04".to_string()
+}
+
+fn default_network() -> String {
+    "none".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Allowed repository pattern for automatic job acceptance
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllowedRepo {
+    /// Owner npub pattern (exact match or "*" for any)
+    pub owner_npub: String,
+
+    /// Repository path pattern (glob-like, e.g., "repos/*" or "repos/myproject")
+    #[serde(default)]
+    pub repo_pattern: String,
+}
+
+impl AllowedRepo {
+    /// Check if this pattern matches a given repo
+    pub fn matches(&self, owner_npub: &str, repo_path: &str) -> bool {
+        // Check owner match
+        let owner_matches = self.owner_npub == "*" || self.owner_npub == owner_npub;
+        if !owner_matches {
+            return false;
+        }
+
+        // Check repo pattern match
+        if self.repo_pattern.is_empty() || self.repo_pattern == "*" {
+            return true;
+        }
+
+        // Simple glob matching: "repos/*" matches "repos/anything"
+        if self.repo_pattern.ends_with("/*") {
+            let prefix = &self.repo_pattern[..self.repo_pattern.len() - 2];
+            repo_path.starts_with(prefix)
+        } else {
+            self.repo_pattern == repo_path
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

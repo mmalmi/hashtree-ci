@@ -2,7 +2,7 @@
 
 mod executor;
 
-use ci_core::{RunnerConfig, RunnerIdentity, RunnerIdentityConfig, RunnerLimits};
+use ci_core::{ContainerConfig, RunnerConfig, RunnerIdentity, RunnerIdentityConfig, RunnerLimits};
 use ci_store::{CiStore, HashtreeStore, NpubPathStore};
 use ci_workflow::{parse_workflow, workflow_to_jobs};
 use clap::{Parser, Subcommand};
@@ -27,6 +27,14 @@ enum Commands {
         /// Runner tags (comma-separated)
         #[arg(short, long, value_delimiter = ',')]
         tags: Vec<String>,
+
+        /// Enable container isolation (docker/podman)
+        #[arg(long)]
+        container: bool,
+
+        /// Container image (e.g., "ubuntu:22.04", "rust:1.75")
+        #[arg(long, default_value = "ubuntu:22.04")]
+        image: String,
     },
 
     /// Show runner identity (npub)
@@ -85,7 +93,26 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { name, tags } => {
+        Commands::Init { name, tags, container, image } => {
+            // Detect container runtime if enabled
+            let container_config = if container {
+                let runtime = executor::detect_container_runtime().await
+                    .ok_or_else(|| anyhow::anyhow!("No container runtime found. Install docker or podman."))?;
+                println!("Detected container runtime: {}", runtime);
+                ContainerConfig {
+                    enabled: true,
+                    runtime,
+                    default_image: image,
+                    network: "none".to_string(),
+                    volumes: Vec::new(),
+                    memory_limit: Some("2g".to_string()),
+                    cpu_limit: Some("2".to_string()),
+                    rootless: true,
+                }
+            } else {
+                ContainerConfig::default()
+            };
+
             let identity = RunnerIdentity::generate(name.clone(), tags.clone());
             let config = RunnerConfig {
                 runner: RunnerIdentityConfig {
@@ -93,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
                     nsec: identity.nsec(),
                     tags,
                     limits: RunnerLimits::default(),
+                    container: container_config.clone(),
+                    allowed_repos: Vec::new(),
                 },
             };
 
@@ -108,6 +137,9 @@ async fn main() -> anyhow::Result<()> {
             println!("Runner initialized!");
             println!("  npub: {}", identity.npub());
             println!("  config: {}", config_path.display());
+            if container_config.enabled {
+                println!("  container: {} ({})", container_config.runtime, container_config.default_image);
+            }
             println!("\nAdd this npub to your repo's .hashtree/ci.toml:");
             println!("[[ci.runners]]");
             println!("npub = \"{}\"", identity.npub());
@@ -120,6 +152,21 @@ async fn main() -> anyhow::Result<()> {
             println!("npub: {}", npub);
             println!("name: {}", config.runner.name);
             println!("tags: {:?}", config.runner.tags);
+            if config.runner.container.enabled {
+                println!("container: {} ({})", config.runner.container.runtime, config.runner.container.default_image);
+                println!("  network: {}", config.runner.container.network);
+                if let Some(ref mem) = config.runner.container.memory_limit {
+                    println!("  memory: {}", mem);
+                }
+            } else {
+                println!("container: disabled (WARNING: commands run directly on host)");
+            }
+            if !config.runner.allowed_repos.is_empty() {
+                println!("allowed_repos:");
+                for repo in &config.runner.allowed_repos {
+                    println!("  - {}:{}", repo.owner_npub, repo.repo_pattern);
+                }
+            }
         }
 
         Commands::Run {
@@ -160,8 +207,15 @@ async fn run_ci(
         config.runner.tags.clone(),
     )?;
 
+    let container_config = &config.runner.container;
+
     let repo_dir = PathBuf::from(repo_dir).canonicalize()?;
     println!("Running CI for: {}", repo_dir.display());
+    if container_config.enabled {
+        println!("  Container: {} ({})", container_config.runtime, container_config.default_image);
+    } else {
+        println!("  Container: disabled (running on host)");
+    }
 
     // Determine repo identity
     let owner = owner_npub.unwrap_or_else(|| "local".to_string());
@@ -244,8 +298,8 @@ async fn run_ci(
                 continue;
             }
 
-            // Execute
-            let result = executor::execute_job(&job, &runner, &repo_dir).await?;
+            // Execute with container isolation if configured
+            let result = executor::execute_job_with_container(&job, &runner, &repo_dir, container_config).await?;
 
             println!("    Status: {:?}", result.status);
             for step in &result.steps {

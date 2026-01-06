@@ -36,7 +36,11 @@ cargo install --path crates/ci-runner
 ### 1. Initialize Runner Identity
 
 ```bash
-htci init
+# Basic (no container isolation - only for trusted repos)
+htci init --name my-runner --tags linux,x64
+
+# Recommended: with container isolation
+htci init --name my-runner --tags linux,x64 --container
 ```
 
 This creates `~/.config/hashtree-ci/runner.toml` with a new Nostr keypair:
@@ -50,6 +54,11 @@ tags = ["linux", "x64"]
 [runner.limits]
 max_concurrent_jobs = 4
 job_timeout_secs = 3600
+
+[runner.container]
+enabled = true
+runtime = "docker"
+default_image = "ubuntu:22.04"
 ```
 
 ### 2. Configure Repository
@@ -188,6 +197,21 @@ tags = ["linux", "x64", "docker", "gpu"]
 max_concurrent_jobs = 4
 job_timeout_secs = 3600
 max_artifact_size = 1073741824  # 1GB
+
+# Container isolation (recommended for security)
+[runner.container]
+enabled = true
+runtime = "docker"  # or "podman"
+default_image = "ubuntu:22.04"
+network = "none"    # "none", "host", or "bridge"
+memory_limit = "2g"
+cpu_limit = "2"
+rootless = true
+
+# Restrict which repos can run on this runner
+[[runner.allowed_repos]]
+owner_npub = "npub1myorg..."
+repo_pattern = "repos/*"
 ```
 
 ### Repository Config (`.hashtree/ci.toml`)
@@ -257,6 +281,48 @@ hashtree-ci integrates with [hashtree-ts](https://github.com/mmalmi/hashtree-ts)
    npub1runner/ci/npub1owner/repos/myproject/<commit>/result.json
 4. Displays status badge (✓ success / ✗ failure / ⏳ pending)
 ```
+
+## Security
+
+### Container Isolation
+
+**Strongly recommended**: Enable container isolation to prevent CI jobs from accessing your host system.
+
+```bash
+# Initialize with container support
+htci init --name my-runner --tags linux --container
+```
+
+When container mode is enabled:
+- Jobs run inside Docker/Podman containers
+- Network is disabled by default (`--network=none`)
+- Filesystem is read-only except `/workspace` and `/tmp`
+- Runs as non-root user (uid 1000)
+- All capabilities dropped (`--cap-drop=ALL`)
+- No new privileges (`--security-opt=no-new-privileges`)
+
+### Allowed Repos
+
+Restrict which repositories can run on your runner:
+
+```toml
+# Only accept jobs from specific npub
+[[runner.allowed_repos]]
+owner_npub = "npub1abc..."
+repo_pattern = "repos/*"
+
+# Accept jobs from any repo under your own npub
+[[runner.allowed_repos]]
+owner_npub = "npub1your..."
+repo_pattern = "*"
+```
+
+### Trust Model
+
+1. **Manual runs** - `htci run` always works for local repos
+2. **Remote jobs** - Only accepted from repos in `allowed_repos` config
+3. **Result verification** - All results cryptographically signed with runner's key
+4. **Repo trust** - Repos define trusted runners in `.hashtree/ci.toml`
 
 ## Crates
 

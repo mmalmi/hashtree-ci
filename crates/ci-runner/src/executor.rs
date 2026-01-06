@@ -1,17 +1,30 @@
 //! Job executor - runs CI jobs and captures output.
+//!
+//! Supports both direct execution and container isolation via Docker/Podman.
 
-use ci_core::{Job, JobResult, JobStatus, RunnerIdentity, StepAction, StepResult};
+use ci_core::{ContainerConfig, Job, JobResult, JobStatus, RunnerIdentity, StepAction, StepResult};
 use chrono::Utc;
 use sha2::Digest;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
 
-/// Execute a CI job and return the result
+/// Execute a CI job and return the result (convenience wrapper without container)
+#[allow(dead_code)]
 pub async fn execute_job(
     job: &Job,
     runner: &RunnerIdentity,
     work_dir: &Path,
+) -> anyhow::Result<JobResult> {
+    execute_job_with_container(job, runner, work_dir, &ContainerConfig::default()).await
+}
+
+/// Execute a CI job with optional container isolation
+pub async fn execute_job_with_container(
+    job: &Job,
+    runner: &RunnerIdentity,
+    work_dir: &Path,
+    container_config: &ContainerConfig,
 ) -> anyhow::Result<JobResult> {
     let mut result = JobResult::new(
         job.id,
@@ -29,7 +42,13 @@ pub async fn execute_job(
         let step_start = std::time::Instant::now();
 
         let (status, exit_code, logs, error) = match &step.action {
-            StepAction::Run(cmd) => execute_shell_step(cmd, work_dir, &job.env).await,
+            StepAction::Run(cmd) => {
+                if container_config.enabled {
+                    execute_container_step(cmd, work_dir, &job.env, container_config).await
+                } else {
+                    execute_shell_step(cmd, work_dir, &job.env).await
+                }
+            }
             StepAction::Uses { action, with: _ } => {
                 // TODO: Implement action support
                 let msg = format!("Action '{}' not yet supported", action);
@@ -141,6 +160,137 @@ async fn execute_shell_step(
     };
 
     (status, exit_code, logs, error)
+}
+
+/// Execute a shell command inside a container
+async fn execute_container_step(
+    cmd: &str,
+    work_dir: &Path,
+    env: &std::collections::HashMap<String, String>,
+    config: &ContainerConfig,
+) -> (JobStatus, Option<i32>, Vec<u8>, Option<String>) {
+    let mut logs = Vec::new();
+
+    // Log the command being run
+    logs.extend_from_slice(format!("$ {} (in container: {})\n", cmd, config.default_image).as_bytes());
+
+    // Build the container run command
+    let mut command = Command::new(&config.runtime);
+    command
+        .arg("run")
+        .arg("--rm");
+
+    // Network isolation
+    match config.network.as_str() {
+        "none" => { command.arg("--network=none"); }
+        "host" => { command.arg("--network=host"); }
+        "bridge" => { /* default, no flag needed */ }
+        _ => { command.arg("--network=none"); }
+    }
+
+    // Resource limits
+    if let Some(ref mem) = config.memory_limit {
+        command.arg(format!("--memory={}", mem));
+    }
+    if let Some(ref cpu) = config.cpu_limit {
+        command.arg(format!("--cpus={}", cpu));
+    }
+
+    // Run as non-root if configured
+    if config.rootless {
+        command.arg("--user=1000:1000");
+    }
+
+    // Mount the work directory
+    let work_dir_abs = work_dir.canonicalize().unwrap_or_else(|_| work_dir.to_path_buf());
+    command.arg("-v").arg(format!("{}:/workspace:rw", work_dir_abs.display()));
+    command.arg("-w").arg("/workspace");
+
+    // Additional volume mounts
+    for vol in &config.volumes {
+        command.arg("-v").arg(vol);
+    }
+
+    // Environment variables
+    for (key, value) in env {
+        command.arg("-e").arg(format!("{}={}", key, value));
+    }
+
+    // Security hardening
+    command.arg("--read-only");
+    command.arg("--tmpfs=/tmp:rw,noexec,nosuid,size=512m");
+    command.arg("--security-opt=no-new-privileges");
+    command.arg("--cap-drop=ALL");
+
+    // Image and command
+    command.arg(&config.default_image);
+    command.arg("sh").arg("-c").arg(cmd);
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let error = format!("Failed to spawn container: {}. Is {} installed?", e, config.runtime);
+            logs.extend_from_slice(error.as_bytes());
+            return (JobStatus::Failure, None, logs, Some(error));
+        }
+    };
+
+    let output = match child.wait_with_output().await {
+        Ok(o) => o,
+        Err(e) => {
+            let error = format!("Failed to wait for container: {}", e);
+            logs.extend_from_slice(error.as_bytes());
+            return (JobStatus::Failure, None, logs, Some(error));
+        }
+    };
+
+    // Capture stdout and stderr
+    logs.extend_from_slice(&output.stdout);
+    if !output.stderr.is_empty() {
+        logs.extend_from_slice(b"\n[stderr]\n");
+        logs.extend_from_slice(&output.stderr);
+    }
+
+    let exit_code = output.status.code();
+    let status = if output.status.success() {
+        JobStatus::Success
+    } else {
+        JobStatus::Failure
+    };
+
+    let error = if !output.status.success() {
+        Some(format!("Container exit code: {:?}", exit_code))
+    } else {
+        None
+    };
+
+    (status, exit_code, logs, error)
+}
+
+/// Check if a container runtime is available
+pub async fn check_container_runtime(runtime: &str) -> bool {
+    Command::new(runtime)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Detect available container runtime (prefers podman for rootless)
+pub async fn detect_container_runtime() -> Option<String> {
+    // Prefer podman for better rootless support
+    if check_container_runtime("podman").await {
+        return Some("podman".to_string());
+    }
+    if check_container_runtime("docker").await {
+        return Some("docker".to_string());
+    }
+    None
 }
 
 #[cfg(test)]
