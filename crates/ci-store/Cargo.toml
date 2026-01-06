@@ -11,8 +11,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-tokio = { workspace = true }
-hashtree-core = { workspace = true }
-hashtree-lmdb = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 sha2 = { workspace = true }
 hex = { workspace = true }

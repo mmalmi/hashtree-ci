@@ -26,3 +26,12 @@ nostr-sdk = { workspace = true }
 bollard = { workspace = true }
 dirs = { workspace = true }
 toml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"
+anyhow = { workspace = true }

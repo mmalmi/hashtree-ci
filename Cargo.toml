@@ -54,5 +54,4 @@ sha2 = "0.10"
 ci-core = { path = "crates/ci-core" }
 ci-workflow = { path = "crates/ci-workflow" }
 ci-runner = { path = "crates/ci-runner" }
-ci-web = { path = "crates/ci-web" }
 ci-store = { path = "crates/ci-store" }

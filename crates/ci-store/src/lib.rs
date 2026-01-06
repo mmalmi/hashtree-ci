@@ -1,6 +1,6 @@
 //! Hashtree storage backend for CI results.
 //!
-//! Stores job results, logs, and artifacts in content-addressed hashtree.
+//! Stores job results at: npub1runner.../ci/npub1owner/repo/path/<commit>/
 
 use async_trait::async_trait;
 use ci_core::{JobResult, JobResultIndex};
@@ -39,4 +39,8 @@ pub trait CiStore: Send + Sync {
 /// In-memory store for testing
 pub mod memory;
 
+/// Hashtree-based store for production
+pub mod hashtree;
+
 pub use memory::MemoryStore;
+pub use hashtree::{HashtreeStore, NpubPathStore};
