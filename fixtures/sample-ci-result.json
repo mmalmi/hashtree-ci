@@ -1,0 +1,43 @@
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "runner_npub": "npub1runner123456789abcdef",
+  "repo_hash": "npub1owner/repos/test-project",
+  "commit": "abc123def456",
+  "workflow": ".github/workflows/ci.yml",
+  "job_name": "build",
+  "status": "success",
+  "started_at": "2025-01-06T10:00:00Z",
+  "finished_at": "2025-01-06T10:05:30Z",
+  "logs_hash": "sha256:1234567890abcdef",
+  "steps": [
+    {
+      "name": "Checkout",
+      "status": "success",
+      "exit_code": 0,
+      "duration_secs": 5,
+      "logs_hash": "sha256:step1hash"
+    },
+    {
+      "name": "Install dependencies",
+      "status": "success",
+      "exit_code": 0,
+      "duration_secs": 120,
+      "logs_hash": "sha256:step2hash"
+    },
+    {
+      "name": "Build",
+      "status": "success",
+      "exit_code": 0,
+      "duration_secs": 180,
+      "logs_hash": "sha256:step3hash"
+    },
+    {
+      "name": "Test",
+      "status": "success",
+      "exit_code": 0,
+      "duration_secs": 45,
+      "logs_hash": "sha256:step4hash"
+    }
+  ],
+  "signature": "schnorr_signature_placeholder"
+}
