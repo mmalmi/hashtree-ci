@@ -119,6 +119,40 @@ pub struct RunnerLimits {
     pub max_artifact_size: u64,
 }
 
+/// Shared hashtree network config (`~/.hashtree/config.toml`)
+/// Used for Nostr relays and Blossom servers - shared with hashtree-ts
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HashtreeConfig {
+    #[serde(default)]
+    pub network: NetworkConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NetworkConfig {
+    /// Nostr relay URLs for publishing/subscribing
+    #[serde(default = "default_relays")]
+    pub relays: Vec<String>,
+
+    /// Blossom server URLs for blob storage
+    #[serde(default = "default_blossom_servers")]
+    pub blossom_servers: Vec<String>,
+}
+
+fn default_relays() -> Vec<String> {
+    vec![
+        "wss://relay.damus.io".to_string(),
+        "wss://nos.lol".to_string(),
+        "wss://relay.nostr.band".to_string(),
+    ]
+}
+
+fn default_blossom_servers() -> Vec<String> {
+    vec![
+        "https://blossom.primal.net".to_string(),
+        "https://cdn.satellite.earth".to_string(),
+    ]
+}
+
 impl Default for RunnerLimits {
     fn default() -> Self {
         Self {
@@ -170,6 +204,29 @@ impl RepoConfig {
             .iter()
             .filter(|r| required_tags.iter().all(|tag| r.tags.contains(tag)))
             .collect()
+    }
+}
+
+impl HashtreeConfig {
+    /// Load shared hashtree config from `~/.hashtree/config.toml`
+    pub fn load() -> anyhow::Result<Self> {
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+        let config_path = home.join(".hashtree/config.toml");
+
+        if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)?;
+            Ok(toml::from_str(&content)?)
+        } else {
+            // Return defaults if no config file exists
+            Ok(Self::default())
+        }
+    }
+
+    /// Load from specific path
+    pub fn load_from(path: &std::path::Path) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        Ok(toml::from_str(&content)?)
     }
 }
 
