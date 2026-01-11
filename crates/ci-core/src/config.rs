@@ -110,6 +110,24 @@ pub struct RunnerIdentityConfig {
     /// Allowed repositories (if empty, only explicit CLI runs are allowed)
     #[serde(default)]
     pub allowed_repos: Vec<AllowedRepo>,
+
+    /// Repositories to watch for updates (daemon mode)
+    #[serde(default)]
+    pub watched_repos: Vec<WatchedRepo>,
+}
+
+/// A repository to watch for updates in daemon mode
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchedRepo {
+    /// Owner's Nostr public key (npub1...)
+    pub owner_npub: String,
+
+    /// Repository path (e.g., "hashtree-ts", "repos/myproject")
+    pub path: String,
+
+    /// Optional: local directory to clone/sync the repo
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<String>,
 }
 
 /// Container runtime configuration for secure job execution

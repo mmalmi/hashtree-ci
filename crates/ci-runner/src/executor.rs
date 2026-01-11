@@ -2,6 +2,7 @@
 //!
 //! Supports both direct execution and container isolation via Docker/Podman.
 
+use crate::action::{execute_builtin_action, ActionRef};
 use ci_core::{ContainerConfig, Job, JobResult, JobStatus, RunnerIdentity, StepAction, StepResult};
 use chrono::Utc;
 use sha2::Digest;
@@ -49,10 +50,8 @@ pub async fn execute_job_with_container(
                     execute_shell_step(cmd, work_dir, &job.env).await
                 }
             }
-            StepAction::Uses { action, with: _ } => {
-                // TODO: Implement action support
-                let msg = format!("Action '{}' not yet supported", action);
-                (JobStatus::Skipped, None, msg.as_bytes().to_vec(), Some(msg))
+            StepAction::Uses { action, with } => {
+                execute_action_step(action, with, work_dir).await
             }
         };
 
@@ -267,6 +266,64 @@ async fn execute_container_step(
     };
 
     (status, exit_code, logs, error)
+}
+
+/// Execute an action step (uses:)
+async fn execute_action_step(
+    action: &str,
+    inputs: &std::collections::HashMap<String, String>,
+    work_dir: &Path,
+) -> (JobStatus, Option<i32>, Vec<u8>, Option<String>) {
+    let mut logs = Vec::new();
+    logs.extend_from_slice(format!("Running action: {}\n", action).as_bytes());
+
+    // Parse the action reference
+    let action_ref = match ActionRef::parse(action) {
+        Some(r) => r,
+        None => {
+            let error = format!("Invalid action format: {}", action);
+            logs.extend_from_slice(error.as_bytes());
+            return (JobStatus::Failure, None, logs, Some(error));
+        }
+    };
+
+    logs.extend_from_slice(
+        format!(
+            "  Owner: {}, Name: {}, Version: {}\n",
+            action_ref.owner, action_ref.name, action_ref.version
+        )
+        .as_bytes(),
+    );
+
+    // Execute based on action type
+    if action_ref.is_builtin() {
+        // Built-in action
+        match execute_builtin_action(&action_ref, inputs, work_dir).await {
+            Ok(result) => {
+                logs.extend_from_slice(result.logs.as_bytes());
+                let status = if result.success {
+                    JobStatus::Success
+                } else {
+                    JobStatus::Failure
+                };
+                let error = if result.success { None } else { Some(result.logs) };
+                (status, Some(0), logs, error)
+            }
+            Err(e) => {
+                logs.extend_from_slice(format!("Action error: {}\n", e).as_bytes());
+                (JobStatus::Failure, None, logs, Some(e))
+            }
+        }
+    } else {
+        // Custom action from hashtree
+        // For now, we don't support fetching custom actions yet
+        let msg = format!(
+            "Custom action '{}' not yet supported (only built-in actions are available)",
+            action
+        );
+        logs.extend_from_slice(msg.as_bytes());
+        (JobStatus::Skipped, None, logs, Some(msg))
+    }
 }
 
 /// Check if a container runtime is available

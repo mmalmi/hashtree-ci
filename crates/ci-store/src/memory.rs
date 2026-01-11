@@ -11,6 +11,7 @@ use crate::CiStore;
 pub struct MemoryStore {
     results: RwLock<HashMap<String, JobResult>>,
     logs: RwLock<HashMap<String, Vec<u8>>>,
+    blobs: RwLock<HashMap<String, Vec<u8>>>,
     index: RwLock<Vec<JobResultIndex>>,
 }
 
@@ -19,8 +20,16 @@ impl MemoryStore {
         Self {
             results: RwLock::new(HashMap::new()),
             logs: RwLock::new(HashMap::new()),
+            blobs: RwLock::new(HashMap::new()),
             index: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Store a blob by content hash
+    fn store_blob(&self, content: &[u8]) -> String {
+        let hash = hex::encode(Sha256::digest(content));
+        self.blobs.write().unwrap().insert(hash.clone(), content.to_vec());
+        hash
     }
 }
 
@@ -53,9 +62,17 @@ impl CiStore for MemoryStore {
         Ok(self.logs.read().unwrap().get(hash).cloned())
     }
 
-    async fn store_artifacts(&self, _path: &std::path::Path) -> anyhow::Result<String> {
-        // TODO: implement with hashtree-fs
-        Ok("not-implemented".to_string())
+    async fn store_artifacts(&self, path: &std::path::Path) -> anyhow::Result<String> {
+        // For memory store, just hash the path for testing
+        // Real implementation would read the directory contents
+        if path.exists() && path.is_file() {
+            let content = std::fs::read(path)?;
+            Ok(self.store_blob(&content))
+        } else {
+            // For directories, create a simple hash of the path
+            let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+            Ok(self.store_blob(&path_bytes))
+        }
     }
 
     async fn index_result(&self, index: &JobResultIndex) -> anyhow::Result<()> {

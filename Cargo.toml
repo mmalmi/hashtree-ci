@@ -26,8 +26,9 @@ nostr = { version = "0.35", features = ["nip44"] }
 nostr-sdk = { version = "0.35", default-features = false }
 
 # Hashtree integration
-hashtree-core = { version = "0.2.1" }
-hashtree-lmdb = { version = "0.2.1" }
+hashtree = "0.4"
+hashtree-fs = "0.2"
+hashtree-blossom = "0.2"
 
 # Config
 toml = "0.8"

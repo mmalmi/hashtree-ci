@@ -1,27 +1,57 @@
 //! Hashtree-based CI store implementation.
 //!
 //! Stores CI results at: npub1runner.../ci/npub1owner/path/to/repo/<commit>/
+//!
+//! Uses hashtree-fs for content-addressable blob storage, compatible with
+//! the hashtree network and Blossom servers.
 
 use async_trait::async_trait;
 use ci_core::{JobResult, JobResultIndex};
+use hashtree_fs::FsBlobStore;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::CiStore;
 
-/// Hashtree-backed CI store
+/// Artifact manifest - lists all files in an artifact directory
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactManifest {
+    /// Map of relative path -> content hash (hex)
+    pub files: HashMap<String, ArtifactFile>,
+    /// Total size in bytes
+    pub total_size: u64,
+    /// When the artifacts were stored
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// An artifact file entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactFile {
+    /// SHA256 hash of file content (hex)
+    pub hash: String,
+    /// File size in bytes
+    pub size: u64,
+}
+
+/// Hashtree-backed CI store using hashtree-fs for blob storage
 pub struct HashtreeStore {
-    /// Base path for local storage (e.g., ~/.local/share/hashtree-ci/)
+    /// Base path for CI-specific data (results, logs)
     base_path: PathBuf,
-    /// This runner's npub
-    runner_npub: String,
+    /// Hashtree blob store for content-addressable storage
+    blob_store: FsBlobStore,
 }
 
 impl HashtreeStore {
-    pub fn new(base_path: PathBuf, runner_npub: String) -> Self {
+    /// Create a new store with CI data at base_path and blobs in base_path/blobs
+    pub fn new(base_path: PathBuf, _runner_npub: String) -> Self {
+        let blobs_path = base_path.join("blobs");
+        let blob_store = FsBlobStore::new(&blobs_path)
+            .expect("Failed to create blob store");
         Self {
             base_path,
-            runner_npub,
+            blob_store,
         }
     }
 
@@ -44,6 +74,74 @@ impl HashtreeStore {
     /// Get path to logs directory
     fn logs_dir(&self, repo_npub: &str, repo_path: &str, commit: &str) -> PathBuf {
         self.result_dir(repo_npub, repo_path, commit).join("logs")
+    }
+
+    /// Store a blob using hashtree-fs, returns hex hash
+    fn store_blob(&self, content: &[u8]) -> anyhow::Result<String> {
+        let hash_bytes: [u8; 32] = sha2::Sha256::digest(content).into();
+        self.blob_store.put_sync(hash_bytes, content)?;
+        Ok(hex::encode(hash_bytes))
+    }
+
+    /// Get a blob by hex hash using hashtree-fs
+    fn get_blob(&self, hash_hex: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let hash_bytes: [u8; 32] = hex::decode(hash_hex)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid hash length"))?;
+        Ok(self.blob_store.get_sync(&hash_bytes)?)
+    }
+
+    /// Store artifacts from a directory, returning the manifest hash
+    async fn store_artifacts_internal(&self, path: &std::path::Path) -> anyhow::Result<String> {
+        use tokio::fs;
+
+        let mut files = HashMap::new();
+        let mut total_size = 0u64;
+
+        // Recursively process directory
+        let mut stack = vec![(path.to_path_buf(), String::new())];
+
+        while let Some((current_path, prefix)) = stack.pop() {
+            let mut entries = fs::read_dir(&current_path).await?;
+
+            while let Some(entry) = entries.next_entry().await? {
+                let entry_path = entry.path();
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                let relative_path = if prefix.is_empty() {
+                    file_name.clone()
+                } else {
+                    format!("{}/{}", prefix, file_name)
+                };
+
+                let metadata = fs::metadata(&entry_path).await?;
+
+                if metadata.is_dir() {
+                    stack.push((entry_path, relative_path));
+                } else if metadata.is_file() {
+                    let content = fs::read(&entry_path).await?;
+                    let size = content.len() as u64;
+                    let hash = self.store_blob(&content)?;
+
+                    files.insert(
+                        relative_path,
+                        ArtifactFile { hash, size },
+                    );
+                    total_size += size;
+                }
+            }
+        }
+
+        // Create and store manifest
+        let manifest = ArtifactManifest {
+            files,
+            total_size,
+            created_at: chrono::Utc::now(),
+        };
+
+        let manifest_json = serde_json::to_vec_pretty(&manifest)?;
+        let manifest_hash = self.store_blob(&manifest_json)?;
+
+        Ok(manifest_hash)
     }
 }
 
@@ -73,18 +171,27 @@ impl CiStore for HashtreeStore {
     }
 
     async fn store_logs(&self, logs: &[u8]) -> anyhow::Result<String> {
-        use sha2::Digest;
-        let hash = hex::encode(sha2::Sha256::digest(logs));
-        Ok(hash)
+        // Store logs in hashtree-fs blob store
+        self.store_blob(logs)
     }
 
     async fn get_logs(&self, hash: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        let _ = hash;
-        Ok(None)
+        self.get_blob(hash)
     }
 
-    async fn store_artifacts(&self, _path: &std::path::Path) -> anyhow::Result<String> {
-        Ok("not-implemented".to_string())
+    async fn store_artifacts(&self, path: &std::path::Path) -> anyhow::Result<String> {
+        if !path.exists() {
+            anyhow::bail!("Artifacts path does not exist: {}", path.display());
+        }
+
+        if path.is_file() {
+            // Single file - store directly as blob
+            let content = tokio::fs::read(path).await?;
+            self.store_blob(&content)
+        } else {
+            // Directory - store as manifest with all files
+            self.store_artifacts_internal(path).await
+        }
     }
 
     async fn index_result(&self, _index: &JobResultIndex) -> anyhow::Result<()> {
@@ -292,6 +399,8 @@ fn parse_repo_identity(repo_hash: &str) -> anyhow::Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CiStore;
+    use tempfile::tempdir;
 
     #[test]
     fn test_parse_repo_identity() {
@@ -309,5 +418,94 @@ mod tests {
             dir.to_string_lossy(),
             "/tmp/test/ci/npub1owner/repos/myproject/abc123"
         );
+    }
+
+    #[tokio::test]
+    async fn test_blob_storage() {
+        let temp = tempdir().unwrap();
+        let store = HashtreeStore::new(temp.path().to_path_buf(), "npub1runner".to_string());
+
+        // Store a blob using hashtree-fs
+        let content = b"Hello, hashtree-fs!";
+        let hash = store.store_blob(content).unwrap();
+
+        // Verify hash is a valid SHA256 hex
+        assert_eq!(hash.len(), 64);
+
+        // Retrieve the blob
+        let retrieved = store.get_blob(&hash).unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap(), content);
+
+        // Verify blob doesn't exist for random hash
+        let fake = store.get_blob("0000000000000000000000000000000000000000000000000000000000000000").unwrap();
+        assert!(fake.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_store_logs() {
+        let temp = tempdir().unwrap();
+        let store = HashtreeStore::new(temp.path().to_path_buf(), "npub1runner".to_string());
+
+        let logs = b"Build output:\n[OK] Step 1\n[OK] Step 2\n";
+        let hash = store.store_logs(logs).await.unwrap();
+
+        let retrieved = store.get_logs(&hash).await.unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap(), logs);
+    }
+
+    #[tokio::test]
+    async fn test_store_artifacts_file() {
+        let temp = tempdir().unwrap();
+        let store = HashtreeStore::new(temp.path().to_path_buf(), "npub1runner".to_string());
+
+        // Create a test file
+        let artifact_file = temp.path().join("artifact.txt");
+        tokio::fs::write(&artifact_file, b"Test artifact content").await.unwrap();
+
+        // Store it
+        let hash = store.store_artifacts(&artifact_file).await.unwrap();
+        assert_eq!(hash.len(), 64);
+
+        // Verify we can retrieve it via hashtree-fs blob store
+        let retrieved = store.get_blob(&hash).unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap(), b"Test artifact content");
+    }
+
+    #[tokio::test]
+    async fn test_store_artifacts_directory() {
+        let temp = tempdir().unwrap();
+        let store = HashtreeStore::new(temp.path().to_path_buf(), "npub1runner".to_string());
+
+        // Create a test directory structure
+        let artifacts_dir = temp.path().join("artifacts");
+        tokio::fs::create_dir_all(artifacts_dir.join("subdir")).await.unwrap();
+        tokio::fs::write(artifacts_dir.join("file1.txt"), b"Content 1").await.unwrap();
+        tokio::fs::write(artifacts_dir.join("file2.txt"), b"Content 2").await.unwrap();
+        tokio::fs::write(artifacts_dir.join("subdir/file3.txt"), b"Content 3").await.unwrap();
+
+        // Store the directory
+        let manifest_hash = store.store_artifacts(&artifacts_dir).await.unwrap();
+        assert_eq!(manifest_hash.len(), 64);
+
+        // Retrieve and parse the manifest from hashtree-fs
+        let manifest_bytes = store.get_blob(&manifest_hash).unwrap().unwrap();
+        let manifest: ArtifactManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+
+        // Verify manifest contents
+        assert_eq!(manifest.files.len(), 3);
+        assert!(manifest.files.contains_key("file1.txt"));
+        assert!(manifest.files.contains_key("file2.txt"));
+        assert!(manifest.files.contains_key("subdir/file3.txt"));
+
+        // Verify file contents are retrievable from hashtree-fs
+        let file1_hash = &manifest.files["file1.txt"].hash;
+        let file1_content = store.get_blob(file1_hash).unwrap().unwrap();
+        assert_eq!(file1_content, b"Content 1");
+
+        // Verify total size
+        assert_eq!(manifest.total_size, 9 + 9 + 9); // "Content 1" + "Content 2" + "Content 3"
     }
 }

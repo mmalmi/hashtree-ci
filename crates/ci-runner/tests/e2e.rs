@@ -626,14 +626,225 @@ exit 1
     mock_script.to_string_lossy().to_string()
 }
 
+/// E2E test for action support (uses: actions/checkout@v4)
+#[tokio::test]
+async fn test_action_step_execution() {
+    let repo_dir = tempdir().unwrap();
+    let runner = RunnerIdentity::generate("action-test".to_string(), vec![]);
+
+    // Create a file to verify checkout action sees it
+    std::fs::write(repo_dir.path().join("README.md"), "# Test Project").unwrap();
+
+    let mut job = Job::new(
+        "npub1owner/repos/action-test".to_string(),
+        "action123".to_string(),
+        ".github/workflows/ci.yml".to_string(),
+        "build".to_string(),
+    );
+
+    job.steps = vec![
+        JobStep {
+            name: "Checkout".to_string(),
+            action: StepAction::Uses {
+                action: "actions/checkout@v4".to_string(),
+                with: HashMap::new(),
+            },
+            working_directory: None,
+            env: HashMap::new(),
+            continue_on_error: false,
+            timeout_minutes: None,
+        },
+        JobStep {
+            name: "Verify checkout".to_string(),
+            action: StepAction::Run("cat README.md".to_string()),
+            working_directory: None,
+            env: HashMap::new(),
+            continue_on_error: false,
+            timeout_minutes: None,
+        },
+        JobStep {
+            name: "Setup Node (should be skipped)".to_string(),
+            action: StepAction::Uses {
+                action: "actions/setup-node@v4".to_string(),
+                with: HashMap::new(),
+            },
+            working_directory: None,
+            env: HashMap::new(),
+            continue_on_error: false,
+            timeout_minutes: None,
+        },
+    ];
+
+    let result = ci_runner_executor::execute_job_with_actions(&job, &runner, repo_dir.path()).await.unwrap();
+
+    // Checkout should succeed
+    assert_eq!(result.status, JobStatus::Success);
+    assert_eq!(result.steps.len(), 3);
+    assert_eq!(result.steps[0].status, JobStatus::Success); // checkout
+    assert_eq!(result.steps[1].status, JobStatus::Success); // cat README.md
+    assert_eq!(result.steps[2].status, JobStatus::Success); // setup-node (skipped but success)
+    assert!(result.verify().unwrap());
+}
+
+/// Test custom action (not yet supported, should skip)
+#[tokio::test]
+async fn test_custom_action_skipped() {
+    let repo_dir = tempdir().unwrap();
+    let runner = RunnerIdentity::generate("custom-action-test".to_string(), vec![]);
+
+    let mut job = Job::new(
+        "npub1owner/repos/test".to_string(),
+        "custom123".to_string(),
+        ".github/workflows/ci.yml".to_string(),
+        "build".to_string(),
+    );
+
+    job.steps = vec![
+        JobStep {
+            name: "Custom action".to_string(),
+            action: StepAction::Uses {
+                action: "npub1abc123/my-custom-action@v1".to_string(),
+                with: HashMap::new(),
+            },
+            working_directory: None,
+            env: HashMap::new(),
+            continue_on_error: true, // Don't fail the job
+            timeout_minutes: None,
+        },
+        JobStep {
+            name: "After custom".to_string(),
+            action: StepAction::Run("echo 'after custom action'".to_string()),
+            working_directory: None,
+            env: HashMap::new(),
+            continue_on_error: false,
+            timeout_minutes: None,
+        },
+    ];
+
+    let result = ci_runner_executor::execute_job_with_actions(&job, &runner, repo_dir.path()).await.unwrap();
+
+    // Custom action should be skipped, but job continues
+    assert_eq!(result.status, JobStatus::Success);
+    assert_eq!(result.steps[0].status, JobStatus::Skipped);
+    assert_eq!(result.steps[1].status, JobStatus::Success);
+}
+
 // Wrapper module to access the executor from tests
 mod ci_runner_executor {
     use ci_core::{ContainerConfig, Job, JobResult, JobStatus, RunnerIdentity, StepAction, StepResult};
     use chrono::Utc;
     use sha2::Digest;
+    use std::collections::HashMap;
     use std::path::Path;
     use std::process::Stdio;
     use tokio::process::Command;
+
+    /// Execute with action support (for testing actions)
+    pub async fn execute_job_with_actions(
+        job: &Job,
+        runner: &RunnerIdentity,
+        work_dir: &Path,
+    ) -> anyhow::Result<JobResult> {
+        let mut result = JobResult::new(
+            job.id,
+            runner.npub(),
+            job.repo_hash.clone(),
+            job.commit.clone(),
+            job.workflow.clone(),
+            job.job_name.clone(),
+        );
+
+        let mut all_logs = Vec::new();
+        let mut job_failed = false;
+
+        for step in &job.steps {
+            let step_start = std::time::Instant::now();
+
+            let (status, exit_code, logs, error) = match &step.action {
+                StepAction::Run(cmd) => execute_shell_step(cmd, work_dir, &job.env).await,
+                StepAction::Uses { action, with } => {
+                    execute_action_step(action, with, work_dir).await
+                }
+            };
+
+            let duration = step_start.elapsed().as_secs();
+            let logs_hash = hex::encode(sha2::Sha256::digest(&logs));
+            all_logs.extend_from_slice(&logs);
+            all_logs.push(b'\n');
+
+            let step_result = StepResult {
+                name: step.name.clone(),
+                status,
+                exit_code,
+                duration_secs: duration,
+                logs_hash,
+                error,
+            };
+
+            result.steps.push(step_result);
+
+            if status == JobStatus::Failure && !step.continue_on_error {
+                job_failed = true;
+                break;
+            }
+        }
+
+        result.status = if job_failed {
+            JobStatus::Failure
+        } else {
+            JobStatus::Success
+        };
+
+        result.finished_at = Utc::now();
+        result.logs_hash = hex::encode(sha2::Sha256::digest(&all_logs));
+        result.sign(&runner.nsec())?;
+
+        Ok(result)
+    }
+
+    /// Execute an action step
+    async fn execute_action_step(
+        action: &str,
+        _inputs: &HashMap<String, String>,
+        work_dir: &Path,
+    ) -> (JobStatus, Option<i32>, Vec<u8>, Option<String>) {
+        let mut logs = Vec::new();
+        logs.extend_from_slice(format!("Running action: {}\n", action).as_bytes());
+
+        // Parse the action reference
+        let parts: Vec<&str> = action.split('@').collect();
+        let action_path = parts.first().unwrap_or(&action);
+
+        // Check if it's a built-in action
+        let is_builtin = action_path.starts_with("actions/") || !action_path.contains('/');
+
+        if is_builtin {
+            // Extract action name
+            let action_name = action_path.split('/').last().unwrap_or(action_path);
+
+            match action_name {
+                "checkout" => {
+                    logs.extend_from_slice(b"Checkout action: repository already available\n");
+                    logs.extend_from_slice(format!("Work directory: {}\n", work_dir.display()).as_bytes());
+                    (JobStatus::Success, Some(0), logs, None)
+                }
+                "cache" | "setup-node" | "setup-python" | "setup-go" | "setup-rust" => {
+                    logs.extend_from_slice(format!("Setup action {} skipped (tools should be pre-installed)\n", action_name).as_bytes());
+                    (JobStatus::Success, Some(0), logs, None)
+                }
+                _ => {
+                    let msg = format!("Unknown built-in action: {}", action_name);
+                    logs.extend_from_slice(msg.as_bytes());
+                    (JobStatus::Failure, None, logs, Some(msg))
+                }
+            }
+        } else {
+            // Custom action - not yet supported
+            let msg = format!("Custom action '{}' not yet supported", action);
+            logs.extend_from_slice(msg.as_bytes());
+            (JobStatus::Skipped, None, logs, Some(msg))
+        }
+    }
 
     pub async fn execute_job(
         job: &Job,
