@@ -8,8 +8,7 @@ use crate::JobStatus;
 
 /// Complete result of a CI job, stored in hashtree.
 ///
-/// This is the primary artifact - signed by the runner's npub
-/// and content-addressed in hashtree.
+/// Authenticity is verified via the Nostr event that publishes the merkle root.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobResult {
     /// Job identifier
@@ -48,9 +47,6 @@ pub struct JobResult {
 
     /// Results of individual steps
     pub steps: Vec<StepResult>,
-
-    /// Signature of this result by runner's nsec
-    pub signature: String,
 }
 
 /// Result of a single step
@@ -107,7 +103,7 @@ pub struct JobResultIndex {
 }
 
 impl JobResult {
-    /// Create a new job result (unsigned)
+    /// Create a new job result
     pub fn new(
         job_id: Uuid,
         runner_npub: String,
@@ -130,70 +126,7 @@ impl JobResult {
             logs_hash: String::new(),
             artifacts_hash: None,
             steps: vec![],
-            signature: String::new(),
         }
-    }
-
-    /// Sign the result with runner's nsec
-    pub fn sign(&mut self, nsec: &str) -> anyhow::Result<()> {
-        use nostr::prelude::*;
-        use sha2::{Digest, Sha256};
-
-        // Create deterministic content to sign
-        let content = serde_json::to_string(&SignableContent {
-            job_id: self.job_id,
-            runner_npub: &self.runner_npub,
-            repo_hash: &self.repo_hash,
-            commit: &self.commit,
-            status: self.status,
-            logs_hash: &self.logs_hash,
-            artifacts_hash: self.artifacts_hash.as_deref(),
-            finished_at: self.finished_at,
-        })?;
-
-        // Hash the content and sign it
-        let hash = Sha256::digest(content.as_bytes());
-        let keys = Keys::parse(nsec)?;
-        let secp = nostr::secp256k1::Secp256k1::new();
-        let message = nostr::secp256k1::Message::from_digest(hash.into());
-        let keypair = keys.secret_key().keypair(&secp);
-        let sig = secp.sign_schnorr(&message, &keypair);
-
-        self.signature = sig.to_string();
-        Ok(())
-    }
-
-    /// Verify the signature
-    pub fn verify(&self) -> anyhow::Result<bool> {
-        use nostr::prelude::*;
-        use sha2::{Digest, Sha256};
-        use std::str::FromStr;
-
-        let content = serde_json::to_string(&SignableContent {
-            job_id: self.job_id,
-            runner_npub: &self.runner_npub,
-            repo_hash: &self.repo_hash,
-            commit: &self.commit,
-            status: self.status,
-            logs_hash: &self.logs_hash,
-            artifacts_hash: self.artifacts_hash.as_deref(),
-            finished_at: self.finished_at,
-        })?;
-
-        // Hash the content
-        let hash = Sha256::digest(content.as_bytes());
-        let message = nostr::secp256k1::Message::from_digest(hash.into());
-
-        // Parse pubkey and signature
-        let pubkey = PublicKey::parse(&self.runner_npub)?;
-        let sig = nostr::secp256k1::schnorr::Signature::from_str(&self.signature)?;
-
-        // Verify using secp256k1
-        let secp = nostr::secp256k1::Secp256k1::verification_only();
-        let xonly = pubkey.to_bytes();
-        let xonly_pubkey = nostr::secp256k1::XOnlyPublicKey::from_slice(&xonly)?;
-
-        Ok(secp.verify_schnorr(&sig, &message, &xonly_pubkey).is_ok())
     }
 
     /// Create index entry for this result
@@ -209,16 +142,4 @@ impl JobResult {
             finished_at: self.finished_at,
         }
     }
-}
-
-#[derive(Serialize)]
-struct SignableContent<'a> {
-    job_id: Uuid,
-    runner_npub: &'a str,
-    repo_hash: &'a str,
-    commit: &'a str,
-    status: JobStatus,
-    logs_hash: &'a str,
-    artifacts_hash: Option<&'a str>,
-    finished_at: DateTime<Utc>,
 }

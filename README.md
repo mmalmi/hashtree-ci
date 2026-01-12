@@ -1,13 +1,12 @@
 # hashtree-ci
 
-Decentralized CI system built on Nostr and hashtree. Executes GitHub Actions workflows with cryptographically signed results stored in a content-addressed path space.
+Decentralized CI system built on Nostr and hashtree. Executes GitHub Actions workflows with results stored in content-addressed merkle trees.
 
 ## Features
 
 - **GitHub Actions compatible** - Parses `.github/workflows/*.yml` files
 - **Decentralized** - No central server, results stored at runner's npub path
-- **Cryptographically signed** - Results signed with runner's Nostr key (Schnorr)
-- **Verifiable** - Anyone can verify results using runner's public key
+- **Content-addressed** - Results stored as hashtree merkle trees, viewable on files.iris.to
 - **Tag-based routing** - Jobs routed to runners based on `runs-on` tags
 
 ## Architecture
@@ -284,7 +283,7 @@ tags = ["macos", "arm64"]
 
 ## Result Format
 
-Results are stored as signed JSON:
+Results are stored as JSON in the hashtree:
 
 ```json
 {
@@ -306,10 +305,11 @@ Results are stored as signed JSON:
       "duration_secs": 300,
       "logs_hash": "sha256:..."
     }
-  ],
-  "signature": "<schnorr-signature>"
+  ]
 }
 ```
+
+Authenticity is verified via the Nostr event that publishes the merkle root.
 
 ## Integration with hashtree-ts
 
@@ -483,7 +483,7 @@ repo_pattern = "*"
 
 1. **Manual runs** - `htci run` always works for local repos
 2. **Remote jobs** - Only accepted from repos in `allowed_repos` config
-3. **Result verification** - All results cryptographically signed with runner's key
+3. **Result verification** - Results verified via Nostr event signature
 4. **Repo trust** - Repos define trusted runners in `.hashtree/ci.toml`
 
 ## Crates

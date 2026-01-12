@@ -348,7 +348,8 @@ async fn run_ci(
             }
 
             // Execute with container isolation if configured
-            let result = executor::execute_job_with_container(&job, &runner, &repo_dir, container_config).await?;
+            let execution = executor::execute_job_with_container(&job, &runner, &repo_dir, container_config).await?;
+            let result = &execution.result;
 
             println!("    Status: {:?}", result.status);
             for step in &result.steps {
@@ -362,23 +363,19 @@ async fn run_ci(
 
             // Store result locally
             store
-                .store_ci_result(&owner, &path, &commit_sha, &result)
+                .store_ci_result(&owner, &path, &commit_sha, result)
                 .await?;
 
-            // Collect logs for publishing
-            let mut logs = std::collections::HashMap::new();
-            for step in &result.steps {
-                // For now use placeholder - in real impl, capture actual step output
-                logs.insert(step.name.clone(), format!("Step: {}\nStatus: {:?}\nDuration: {}s\n",
-                    step.name, step.status, step.duration_secs).into_bytes());
+            // Store step logs
+            for (step_name, log_data) in &execution.step_logs {
                 store
-                    .store_step_logs(&owner, &path, &commit_sha, &step.name, b"[logs]")
+                    .store_step_logs(&owner, &path, &commit_sha, step_name, log_data)
                     .await?;
             }
 
             // Publish to hashtree network
             println!("    Publishing to hashtree network...");
-            match ci_publisher.publish_result(&result, &logs, &path, &commit_sha).await {
+            match ci_publisher.publish_result(result, &execution.step_logs, &path, &commit_sha).await {
                 Ok(cid) => {
                     let hash_hex = hashtree_core::to_hex(&cid.hash);
                     println!("    Published: {}.bin", hash_hex);
@@ -619,7 +616,7 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
                     }
 
                     // Execute
-                    let result = match executor::execute_job_with_container(
+                    let execution = match executor::execute_job_with_container(
                         &job,
                         &runner,
                         &repo_dir,
@@ -633,6 +630,7 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
                             continue;
                         }
                     };
+                    let result = &execution.result;
 
                     let status_icon = if result.status == ci_core::JobStatus::Success {
                         "✓"
@@ -643,20 +641,17 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
 
                     // Store result locally (cache)
                     if let Err(e) = store
-                        .store_ci_result(&update.owner_npub, &update.path, &commit_sha, &result)
+                        .store_ci_result(&update.owner_npub, &update.path, &commit_sha, result)
                         .await
                     {
                         println!("      Error storing local cache: {}", e);
                     }
 
                     // Publish to Blossom and announce via Nostr
-                    // Collect logs (empty for now, real logs would come from executor)
-                    let logs = std::collections::HashMap::new();
-
-                    match ci_publisher.publish_result(&result, &logs, &update.path, &commit_sha).await {
+                    match ci_publisher.publish_result(result, &execution.step_logs, &update.path, &commit_sha).await {
                         Ok(cid) => {
                             let hash_hex = hashtree_core::to_hex(&cid.hash);
-                            println!("      Published: {}", &hash_hex[..16]);
+                            println!("      Published: {}.bin", hash_hex);
                             println!("      View: {}", ci_publisher.view_url(&update.path, &commit_sha));
                         }
                         Err(e) => {

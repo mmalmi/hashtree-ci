@@ -6,9 +6,17 @@ use crate::action::{execute_builtin_action, ActionRef};
 use ci_core::{ContainerConfig, Job, JobResult, JobStatus, RunnerIdentity, StepAction, StepResult};
 use chrono::Utc;
 use sha2::Digest;
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
+
+/// Result of job execution including logs
+pub struct ExecutionResult {
+    pub result: JobResult,
+    /// Step name -> log bytes
+    pub step_logs: HashMap<String, Vec<u8>>,
+}
 
 /// Execute a CI job and return the result (convenience wrapper without container)
 #[allow(dead_code)]
@@ -16,7 +24,7 @@ pub async fn execute_job(
     job: &Job,
     runner: &RunnerIdentity,
     work_dir: &Path,
-) -> anyhow::Result<JobResult> {
+) -> anyhow::Result<ExecutionResult> {
     execute_job_with_container(job, runner, work_dir, &ContainerConfig::default()).await
 }
 
@@ -26,7 +34,7 @@ pub async fn execute_job_with_container(
     runner: &RunnerIdentity,
     work_dir: &Path,
     container_config: &ContainerConfig,
-) -> anyhow::Result<JobResult> {
+) -> anyhow::Result<ExecutionResult> {
     let mut result = JobResult::new(
         job.id,
         runner.npub(),
@@ -37,6 +45,7 @@ pub async fn execute_job_with_container(
     );
 
     let mut all_logs = Vec::new();
+    let mut step_logs = HashMap::new();
     let mut job_failed = false;
 
     for step in &job.steps {
@@ -61,6 +70,7 @@ pub async fn execute_job_with_container(
         let logs_hash = hex::encode(sha2::Sha256::digest(&logs));
         all_logs.extend_from_slice(&logs);
         all_logs.push(b'\n');
+        step_logs.insert(step.name.clone(), logs);
 
         let step_result = StepResult {
             name: step.name.clone(),
@@ -90,10 +100,7 @@ pub async fn execute_job_with_container(
     result.finished_at = Utc::now();
     result.logs_hash = hex::encode(sha2::Sha256::digest(&all_logs));
 
-    // Sign the result
-    result.sign(&runner.nsec())?;
-
-    Ok(result)
+    Ok(ExecutionResult { result, step_logs })
 }
 
 /// Execute a shell command step
