@@ -105,6 +105,55 @@ htci init              # Generate new runner identity
 htci whoami            # Show runner npub and tags
 htci run <repo-path>   # Execute workflows for repository
 htci results <repo>    # Query stored results
+htci daemon            # Run daemon watching repos via Nostr
+htci watch <npub> <path> [--local <dir>]  # Add repo to watch list
+htci list-watch        # List watched repos
+htci unwatch <npub> <path>  # Remove from watch list
+```
+
+### Running as a Daemon
+
+The daemon watches for Nostr tree root updates and automatically runs CI:
+
+```bash
+# Add repos to watch
+htci watch npub1owner... hashtree-ts --local /path/to/local/clone
+
+# Start daemon (foreground)
+htci daemon
+
+# Or run in background with nohup
+nohup htci daemon > /var/log/htci.log 2>&1 &
+```
+
+### Systemd Service (Recommended for Production)
+
+Create `/etc/systemd/system/htci.service`:
+
+```ini
+[Unit]
+Description=Hashtree CI Runner Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=ci-runner
+ExecStart=/usr/local/bin/htci daemon
+Restart=always
+RestartSec=10
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable htci
+sudo systemctl start htci
+sudo journalctl -u htci -f  # View logs
 ```
 
 ## Workflow Support

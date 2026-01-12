@@ -255,7 +255,7 @@ pub struct HashtreeConfig {
     pub network: NetworkConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// Nostr relay URLs for publishing/subscribing
     #[serde(default = "default_relays")]
@@ -264,6 +264,15 @@ pub struct NetworkConfig {
     /// Blossom server URLs for blob storage
     #[serde(default = "default_blossom_servers")]
     pub blossom_servers: Vec<String>,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            relays: default_relays(),
+            blossom_servers: default_blossom_servers(),
+        }
+    }
 }
 
 fn default_relays() -> Vec<String> {

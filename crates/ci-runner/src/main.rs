@@ -2,6 +2,7 @@
 
 mod action;
 mod executor;
+mod publisher;
 mod watcher;
 
 use ci_core::{ContainerConfig, RunnerConfig, RunnerIdentity, RunnerIdentityConfig, RunnerLimits, WatchedRepo};
@@ -253,6 +254,10 @@ async fn run_ci(
 
     let container_config = &config.runner.container;
 
+    // Create publisher for Blossom/Nostr uploads
+    let keys = nostr_sdk::prelude::Keys::parse(&config.runner.nsec)?;
+    let ci_publisher = publisher::CiPublisher::new(keys).await?;
+
     let repo_dir = PathBuf::from(repo_dir).canonicalize()?;
     println!("Running CI for: {}", repo_dir.display());
     if container_config.enabled {
@@ -355,26 +360,40 @@ async fn run_ci(
                 println!("    {} {} ({}s)", icon, step.name, step.duration_secs);
             }
 
-            // Store result
+            // Store result locally
             store
                 .store_ci_result(&owner, &path, &commit_sha, &result)
                 .await?;
 
-            // Store logs
+            // Collect logs for publishing
+            let mut logs = std::collections::HashMap::new();
             for step in &result.steps {
-                // In a real impl, we'd store actual logs
+                // For now use placeholder - in real impl, capture actual step output
+                logs.insert(step.name.clone(), format!("Step: {}\nStatus: {:?}\nDuration: {}s\n",
+                    step.name, step.status, step.duration_secs).into_bytes());
                 store
                     .store_step_logs(&owner, &path, &commit_sha, &step.name, b"[logs]")
                     .await?;
             }
 
-            println!(
-                "    Result stored at: {}/ci/{}/{}/{}",
-                runner.npub(),
-                owner,
-                path,
-                commit_sha
-            );
+            // Publish to Blossom and announce on Nostr
+            println!("    Publishing to hashtree network...");
+            match ci_publisher.publish_result(&result, &logs, &path, &commit_sha).await {
+                Ok(tree) => {
+                    println!("    Published: {}", &tree.root_hash[..16]);
+                    println!("    View: {}", ci_publisher.view_url(&path, &commit_sha));
+                }
+                Err(e) => {
+                    println!("    Warning: Failed to publish: {}", e);
+                    println!(
+                        "    Local result stored at: {}/ci/{}/{}/{}",
+                        runner.npub(),
+                        owner,
+                        path,
+                        commit_sha
+                    );
+                }
+            }
         }
     }
 
@@ -466,12 +485,17 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
     }
     println!();
 
-    // Setup store
+    // Setup store (local cache)
     let data_dir = dirs::data_local_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not find data directory"))?
         .join("hashtree-ci");
     std::fs::create_dir_all(&data_dir)?;
     let store = HashtreeStore::new(data_dir, runner.npub());
+
+    // Setup publisher for Blossom/Nostr
+    let keys = nostr_sdk::prelude::Keys::parse(&config.runner.nsec)?;
+    let ci_publisher = publisher::CiPublisher::new(keys).await?;
+    println!("Publisher ready (Blossom + Nostr)");
 
     // Create channel for updates
     let (tx, mut rx) = tokio::sync::mpsc::channel::<watcher::RepoUpdate>(100);
@@ -616,12 +640,26 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
                     };
                     println!("      {} {:?}", status_icon, result.status);
 
-                    // Store result
+                    // Store result locally (cache)
                     if let Err(e) = store
                         .store_ci_result(&update.owner_npub, &update.path, &commit_sha, &result)
                         .await
                     {
-                        println!("      Error storing result: {}", e);
+                        println!("      Error storing local cache: {}", e);
+                    }
+
+                    // Publish to Blossom and announce via Nostr
+                    // Collect logs (empty for now, real logs would come from executor)
+                    let logs = std::collections::HashMap::new();
+
+                    match ci_publisher.publish_result(&result, &logs, &update.path, &commit_sha).await {
+                        Ok(tree) => {
+                            println!("      Published: {}", &tree.root_hash[..16]);
+                            println!("      View: {}", ci_publisher.view_url(&update.path, &commit_sha));
+                        }
+                        Err(e) => {
+                            println!("      Error publishing: {}", e);
+                        }
                     }
                 }
             }
