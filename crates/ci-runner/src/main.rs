@@ -376,11 +376,12 @@ async fn run_ci(
                     .await?;
             }
 
-            // Publish to Blossom and announce on Nostr
+            // Publish to hashtree network
             println!("    Publishing to hashtree network...");
             match ci_publisher.publish_result(&result, &logs, &path, &commit_sha).await {
-                Ok(tree) => {
-                    println!("    Published: {}", &tree.root_hash[..16]);
+                Ok(cid) => {
+                    let hash_hex = hashtree_core::to_hex(&cid.hash);
+                    println!("    Published: {}.bin", hash_hex);
                     println!("    View: {}", ci_publisher.view_url(&path, &commit_sha));
                 }
                 Err(e) => {
@@ -653,8 +654,9 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
                     let logs = std::collections::HashMap::new();
 
                     match ci_publisher.publish_result(&result, &logs, &update.path, &commit_sha).await {
-                        Ok(tree) => {
-                            println!("      Published: {}", &tree.root_hash[..16]);
+                        Ok(cid) => {
+                            let hash_hex = hashtree_core::to_hex(&cid.hash);
+                            println!("      Published: {}", &hash_hex[..16]);
                             println!("      View: {}", ci_publisher.view_url(&update.path, &commit_sha));
                         }
                         Err(e) => {

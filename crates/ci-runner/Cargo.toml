@@ -33,6 +33,11 @@ hex = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 base64 = "0.22"
 
+# hashtree-rs for proper merkle tree publishing
+hashtree-core = { path = "../../../hashtree-rs/crates/hashtree-core" }
+hashtree-blossom = { path = "../../../hashtree-rs/crates/hashtree-blossom", features = ["config"] }
+hashtree-resolver = { path = "../../../hashtree-rs/crates/hashtree-resolver", features = ["nostr"] }
+
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = "3"
