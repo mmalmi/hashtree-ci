@@ -16,7 +16,7 @@
 //!         step2.txt
 //! ```
 
-use ci_core::JobResult;
+use ci_core::{HashtreeConfig, JobResult};
 use hashtree_blossom::BlossomClient;
 use hashtree_core::{Cid, DirEntry, HashTree, HashTreeConfig, LinkType, MemoryStore, Store, to_hex};
 use hashtree_resolver::nostr::{NostrResolverConfig, NostrRootResolver};
@@ -36,12 +36,16 @@ pub struct CiPublisher {
 impl CiPublisher {
     /// Create a new publisher
     pub async fn new(keys: Keys) -> anyhow::Result<Self> {
-        let config = NostrResolverConfig {
+        let mut resolver_config = NostrResolverConfig {
             secret_key: Some(keys.clone()),
             resolve_timeout: Duration::from_secs(5),
             ..Default::default()
         };
-        let resolver = NostrRootResolver::new(config).await?;
+        let hashtree_config = HashtreeConfig::load().unwrap_or_default();
+        if !hashtree_config.network.relays.is_empty() {
+            resolver_config.relays = hashtree_config.network.relays;
+        }
+        let resolver = NostrRootResolver::new(resolver_config).await?;
         let blossom = BlossomClient::new(keys.clone());
 
         Ok(Self {
