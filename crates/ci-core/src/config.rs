@@ -125,7 +125,9 @@ pub struct WatchedRepo {
     /// Repository path (e.g., "hashtree-ts", "repos/myproject")
     pub path: String,
 
-    /// Optional: local directory to clone/sync the repo
+    /// Optional: local directory with a clone of the repo
+    /// When set, CI will fetch from remote and run on local copy
+    /// When not set, CI will fetch the tree from Blossom and materialize it
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_path: Option<String>,
 }

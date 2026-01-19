@@ -99,7 +99,7 @@ enum Commands {
         #[arg(short, long)]
         path: String,
 
-        /// Local directory to clone/sync the repo
+        /// Local directory with a clone of the repo
         #[arg(short, long)]
         local: Option<String>,
     },
@@ -466,10 +466,10 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
     if config.runner.watched_repos.is_empty() {
         println!("No repos configured to watch.");
         println!();
-        println!("Add repos with: htci watch -o <npub> -p <path> [-l <local_path>]");
+        println!("Add repos with: htci watch -o <npub> -p <path> -l <local_path>");
         println!();
         println!("Example:");
-        println!("  htci watch -o npub1abc... -p hashtree-ts -l /path/to/local/clone");
+        println!("  htci watch -o npub1abc... -p hashtree -l /path/to/hashtree/clone");
         return Ok(());
     }
 
@@ -527,7 +527,7 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
             short_hash
         );
 
-        // Find local path for this repo
+        // Find watched repo config
         let watched = config
             .runner
             .watched_repos
@@ -615,7 +615,7 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
                         continue;
                     }
 
-                    // Execute
+                    // Execute with container isolation if enabled
                     let execution = match executor::execute_job_with_container(
                         &job,
                         &runner,
@@ -661,7 +661,8 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
                 }
             }
         } else {
-            println!("  No local path configured - run:");
+            // TODO: Fetch tree from Blossom using merkle_root and materialize to temp dir
+            println!("  No local_path configured - run:");
             println!("    htci watch -o {} -p {} -l /path/to/clone", update.owner_npub, update.path);
         }
     }
@@ -707,12 +708,15 @@ fn add_watched_repo(owner: &str, path: &str, local: Option<String>) -> anyhow::R
     config.runner.watched_repos.push(WatchedRepo {
         owner_npub: owner.to_string(),
         path: path.to_string(),
-        local_path: local,
+        local_path: local.clone(),
     });
 
     save_config(&config)?;
 
     println!("Now watching: {}/{}", owner, path);
+    if let Some(ref local) = local {
+        println!("  Local path: {}", local);
+    }
     println!("Run 'htci daemon' to start watching for updates");
     Ok(())
 }

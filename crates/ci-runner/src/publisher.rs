@@ -70,7 +70,7 @@ impl CiPublisher {
         repo_path: &str,
         commit: &str,
     ) -> anyhow::Result<Cid> {
-        // 1. Build hashtree with CI results (encrypted so upload.iris.to accepts it)
+        // 1. Build hashtree with CI results (encrypted for Blossom compatibility)
         let store = Arc::new(MemoryStore::new());
         let tree = HashTree::new(HashTreeConfig::new(store.clone()));
 
@@ -151,7 +151,7 @@ impl CiPublisher {
             "https://files.iris.to/#/{}/ci/{}/{}",
             self.npub(),
             repo_path,
-            &commit[..8.min(commit.len())]
+            commit
         )
     }
 }
@@ -171,12 +171,12 @@ mod tests {
             "https://files.iris.to/#/{}/ci/{}/{}",
             npub,
             repo_path,
-            &commit[..8]
+            commit
         );
 
         assert_eq!(
             url,
-            "https://files.iris.to/#/npub1tsrng9wsz55988794jucdf3cgmh065e29sgevt8t8wqc687r7p9suu35fu/ci/hashtree-ts/abc123de"
+            "https://files.iris.to/#/npub1tsrng9wsz55988794jucdf3cgmh065e29sgevt8t8wqc687r7p9suu35fu/ci/hashtree-ts/abc123def456"
         );
     }
 
@@ -184,7 +184,7 @@ mod tests {
     async fn test_tree_building() {
         // Test that we can build a hashtree structure
         let store = Arc::new(MemoryStore::new());
-        let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
+        let tree = HashTree::new(HashTreeConfig::new(store.clone()));
 
         // Create a simple file
         let content = b"test content";
