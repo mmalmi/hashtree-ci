@@ -543,8 +543,11 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
                 continue;
             }
 
-            // TODO: Fetch/sync the tree using merkle_root
-            // For now, use the local git HEAD as the commit reference
+            if let Err(e) = sync_local_repo(&repo_dir) {
+                println!("  Warning: {}", e);
+                continue;
+            }
+
             let commit_sha = match get_git_head(&repo_dir) {
                 Ok(h) => h,
                 Err(e) => {
@@ -675,6 +678,71 @@ fn get_npub(config: &RunnerConfig) -> anyhow::Result<String> {
     use nostr::prelude::*;
     let keys = Keys::parse(&config.runner.nsec)?;
     Ok(keys.public_key().to_bech32()?)
+}
+
+fn sync_local_repo(repo_dir: &PathBuf) -> anyhow::Result<()> {
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_dir)
+        .output()?;
+
+    if !status.status.success() {
+        anyhow::bail!("git status failed");
+    }
+
+    if !status.stdout.is_empty() {
+        anyhow::bail!("local repo has uncommitted changes; use a clean clone for CI");
+    }
+
+    let fetch = std::process::Command::new("git")
+        .args(["fetch", "--prune", "origin"])
+        .current_dir(repo_dir)
+        .output()?;
+
+    if !fetch.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch.stderr);
+        anyhow::bail!("git fetch failed: {}", stderr.trim());
+    }
+
+    let remote_head = resolve_remote_head(repo_dir)?;
+    let reset = std::process::Command::new("git")
+        .args(["reset", "--hard", &remote_head])
+        .current_dir(repo_dir)
+        .output()?;
+
+    if !reset.status.success() {
+        let stderr = String::from_utf8_lossy(&reset.stderr);
+        anyhow::bail!("git reset --hard {} failed: {}", remote_head, stderr.trim());
+    }
+
+    Ok(())
+}
+
+fn resolve_remote_head(repo_dir: &PathBuf) -> anyhow::Result<String> {
+    let head = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .current_dir(repo_dir)
+        .output()?;
+
+    if head.status.success() {
+        let name = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        if !name.is_empty() {
+            return Ok(name);
+        }
+    }
+
+    for candidate in ["origin/main", "origin/master"] {
+        let ref_name = format!("refs/remotes/{}", candidate);
+        let status = std::process::Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", &ref_name])
+            .current_dir(repo_dir)
+            .status()?;
+        if status.success() {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    anyhow::bail!("could not determine remote default branch");
 }
 
 fn get_git_head(repo_dir: &PathBuf) -> anyhow::Result<String> {
