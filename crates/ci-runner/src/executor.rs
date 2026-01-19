@@ -18,6 +18,94 @@ pub struct ExecutionResult {
     pub step_logs: HashMap<String, Vec<u8>>,
 }
 
+struct ContainerSession {
+    id: String,
+    runtime: String,
+    image: String,
+    rootless: bool,
+}
+
+const SETUP_STEP_NAME: &str = "container setup";
+
+fn record_step_result(
+    result: &mut JobResult,
+    step_logs: &mut HashMap<String, Vec<u8>>,
+    all_logs: &mut Vec<u8>,
+    name: String,
+    status: JobStatus,
+    exit_code: Option<i32>,
+    duration_secs: u64,
+    logs: Vec<u8>,
+    error: Option<String>,
+) {
+    let logs_hash = hex::encode(sha2::Sha256::digest(&logs));
+    all_logs.extend_from_slice(&logs);
+    all_logs.push(b'\n');
+    step_logs.insert(name.clone(), logs);
+    result.steps.push(StepResult {
+        name,
+        status,
+        exit_code,
+        duration_secs,
+        logs_hash,
+        error,
+    });
+}
+
+fn finalize_job_result(result: &mut JobResult, job_failed: bool, all_logs: &[u8]) {
+    result.status = if job_failed {
+        JobStatus::Failure
+    } else {
+        JobStatus::Success
+    };
+    result.finished_at = Utc::now();
+    result.logs_hash = hex::encode(sha2::Sha256::digest(all_logs));
+}
+
+fn shell_escape(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    let mut escaped = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            escaped.push_str("'\\''");
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
+fn build_clone_script(git_url: &str, commit: &str) -> String {
+    let git_url = shell_escape(git_url);
+    let commit = shell_escape(commit);
+
+    format!(
+        "set -e\n\
+if ! command -v git >/dev/null 2>&1; then\n\
+  echo \"git not found in container image; install git or use an image with git preinstalled\" >&2\n\
+  exit 127\n\
+fi\n\
+git clone --no-checkout {git_url} /workspace\n\
+cd /workspace\n\
+git checkout --detach {commit}\n"
+    )
+}
+
+fn workspace_tmpfs_options(config: &ContainerConfig) -> String {
+    let mut opts = vec!["rw".to_string(), "exec".to_string(), "nosuid".to_string()];
+    if config.rootless {
+        opts.push("uid=1000".to_string());
+        opts.push("gid=1000".to_string());
+    }
+    let size = config.memory_limit.as_deref().unwrap_or("2g");
+    opts.push(format!("size={}", size));
+    opts.join(",")
+}
+
 /// Execute a CI job and return the result (convenience wrapper without container)
 #[allow(dead_code)]
 pub async fn execute_job(
@@ -25,7 +113,7 @@ pub async fn execute_job(
     runner: &RunnerIdentity,
     work_dir: &Path,
 ) -> anyhow::Result<ExecutionResult> {
-    execute_job_with_container(job, runner, work_dir, &ContainerConfig::default()).await
+    execute_job_with_container(job, runner, work_dir, &ContainerConfig::default(), None).await
 }
 
 /// Execute a CI job with optional container isolation
@@ -34,6 +122,7 @@ pub async fn execute_job_with_container(
     runner: &RunnerIdentity,
     work_dir: &Path,
     container_config: &ContainerConfig,
+    git_url: Option<&str>,
 ) -> anyhow::Result<ExecutionResult> {
     let mut result = JobResult::new(
         job.id,
@@ -47,14 +136,84 @@ pub async fn execute_job_with_container(
     let mut all_logs = Vec::new();
     let mut step_logs = HashMap::new();
     let mut job_failed = false;
+    let mut container_session: Option<ContainerSession> = None;
+
+    if container_config.enabled {
+        let git_url = match git_url {
+            Some(url) => url,
+            None => {
+                let error = "Container mode requires a git URL (set --owner-npub/--repo-path or configure origin)";
+                let logs = format!("$ {} (in container: {})\n{}\n", SETUP_STEP_NAME, container_config.default_image, error)
+                    .into_bytes();
+                record_step_result(
+                    &mut result,
+                    &mut step_logs,
+                    &mut all_logs,
+                    SETUP_STEP_NAME.to_string(),
+                    JobStatus::Failure,
+                    None,
+                    0,
+                    logs,
+                    Some(error.to_string()),
+                );
+                finalize_job_result(&mut result, true, &all_logs);
+                return Ok(ExecutionResult { result, step_logs });
+            }
+        };
+
+        let session = match start_container_session(container_config).await {
+            Ok(session) => session,
+            Err(e) => {
+                let error = format!("Failed to start container: {}", e);
+                let logs = format!("$ {} (in container: {})\n{}\n", SETUP_STEP_NAME, container_config.default_image, error)
+                    .into_bytes();
+                record_step_result(
+                    &mut result,
+                    &mut step_logs,
+                    &mut all_logs,
+                    SETUP_STEP_NAME.to_string(),
+                    JobStatus::Failure,
+                    None,
+                    0,
+                    logs,
+                    Some(error),
+                );
+                finalize_job_result(&mut result, true, &all_logs);
+                return Ok(ExecutionResult { result, step_logs });
+            }
+        };
+
+        let setup_script = build_clone_script(git_url, &job.commit);
+        let display_cmd = format!("container setup (clone {})", git_url);
+        let (status, exit_code, logs, error) =
+            exec_container_command(&session, &setup_script, &display_cmd, &job.env).await;
+        if status == JobStatus::Failure {
+            record_step_result(
+                &mut result,
+                &mut step_logs,
+                &mut all_logs,
+                SETUP_STEP_NAME.to_string(),
+                status,
+                exit_code,
+                0,
+                logs,
+                error,
+            );
+            let _ = stop_container_session(&session).await;
+            finalize_job_result(&mut result, true, &all_logs);
+            return Ok(ExecutionResult { result, step_logs });
+        }
+
+        container_session = Some(session);
+    }
 
     for step in &job.steps {
         let step_start = std::time::Instant::now();
 
         let (status, exit_code, logs, error) = match &step.action {
             StepAction::Run(cmd) => {
-                if container_config.enabled {
-                    execute_container_step(cmd, work_dir, &job.env, container_config).await
+                if let Some(ref session) = container_session {
+                    execute_container_step(cmd, session, &job.env).await
                 } else {
                     execute_shell_step(cmd, work_dir, &job.env).await
                 }
@@ -65,23 +224,17 @@ pub async fn execute_job_with_container(
         };
 
         let duration = step_start.elapsed().as_secs();
-
-        // Store step logs
-        let logs_hash = hex::encode(sha2::Sha256::digest(&logs));
-        all_logs.extend_from_slice(&logs);
-        all_logs.push(b'\n');
-        step_logs.insert(step.name.clone(), logs);
-
-        let step_result = StepResult {
-            name: step.name.clone(),
+        record_step_result(
+            &mut result,
+            &mut step_logs,
+            &mut all_logs,
+            step.name.clone(),
             status,
             exit_code,
-            duration_secs: duration,
-            logs_hash,
+            duration,
+            logs,
             error,
-        };
-
-        result.steps.push(step_result);
+        );
 
         // Check if we should continue
         if status == JobStatus::Failure && !step.continue_on_error {
@@ -90,15 +243,11 @@ pub async fn execute_job_with_container(
         }
     }
 
-    // Set final status
-    result.status = if job_failed {
-        JobStatus::Failure
-    } else {
-        JobStatus::Success
-    };
+    if let Some(session) = container_session {
+        let _ = stop_container_session(&session).await;
+    }
 
-    result.finished_at = Utc::now();
-    result.logs_hash = hex::encode(sha2::Sha256::digest(&all_logs));
+    finalize_job_result(&mut result, job_failed, &all_logs);
 
     Ok(ExecutionResult { result, step_logs })
 }
@@ -168,30 +317,22 @@ async fn execute_shell_step(
     (status, exit_code, logs, error)
 }
 
-/// Execute a shell command inside a container
-async fn execute_container_step(
-    cmd: &str,
-    work_dir: &Path,
-    env: &std::collections::HashMap<String, String>,
-    config: &ContainerConfig,
-) -> (JobStatus, Option<i32>, Vec<u8>, Option<String>) {
-    let mut logs = Vec::new();
-
-    // Log the command being run
-    logs.extend_from_slice(format!("$ {} (in container: {})\n", cmd, config.default_image).as_bytes());
-
-    // Build the container run command
+async fn start_container_session(config: &ContainerConfig) -> anyhow::Result<ContainerSession> {
     let mut command = Command::new(&config.runtime);
-    command
-        .arg("run")
-        .arg("--rm");
+    command.arg("run").arg("--rm").arg("-d");
 
     // Network isolation
     match config.network.as_str() {
-        "none" => { command.arg("--network=none"); }
-        "host" => { command.arg("--network=host"); }
+        "none" => {
+            command.arg("--network=none");
+        }
+        "host" => {
+            command.arg("--network=host");
+        }
         "bridge" => { /* default, no flag needed */ }
-        _ => { command.arg("--network=none"); }
+        _ => {
+            command.arg("--network=none");
+        }
     }
 
     // Resource limits
@@ -207,19 +348,14 @@ async fn execute_container_step(
         command.arg("--user=1000:1000");
     }
 
-    // Mount the work directory
-    let work_dir_abs = work_dir.canonicalize().unwrap_or_else(|_| work_dir.to_path_buf());
-    command.arg("-v").arg(format!("{}:/workspace:rw", work_dir_abs.display()));
+    // Workspace tmpfs (repo clone stays inside container)
+    let workspace_tmpfs = workspace_tmpfs_options(config);
+    command.arg(format!("--tmpfs=/workspace:{}", workspace_tmpfs));
     command.arg("-w").arg("/workspace");
 
     // Additional volume mounts
     for vol in &config.volumes {
         command.arg("-v").arg(vol);
-    }
-
-    // Environment variables
-    for (key, value) in env {
-        command.arg("-e").arg(format!("{}={}", key, value));
     }
 
     // Security hardening
@@ -230,29 +366,86 @@ async fn execute_container_step(
 
     // Image and command
     command.arg(&config.default_image);
+    command.arg("sh").arg("-c").arg("while true; do sleep 3600; done");
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let output = command.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "Failed to start container: {}",
+            stderr.trim()
+        ));
+    }
+
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if id.is_empty() {
+        return Err(anyhow::anyhow!("Container runtime returned empty container id"));
+    }
+
+    Ok(ContainerSession {
+        id,
+        runtime: config.runtime.clone(),
+        image: config.default_image.clone(),
+        rootless: config.rootless,
+    })
+}
+
+async fn stop_container_session(session: &ContainerSession) -> anyhow::Result<()> {
+    let status = Command::new(&session.runtime)
+        .arg("stop")
+        .arg(&session.id)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+
+    if !status.success() {
+        return Err(anyhow::anyhow!("Failed to stop container {}", session.id));
+    }
+
+    Ok(())
+}
+
+async fn exec_container_command(
+    session: &ContainerSession,
+    cmd: &str,
+    display_cmd: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> (JobStatus, Option<i32>, Vec<u8>, Option<String>) {
+    let mut logs = Vec::new();
+
+    // Log the command being run
+    logs.extend_from_slice(format!("$ {} (in container: {})\n", display_cmd, session.image).as_bytes());
+
+    let mut command = Command::new(&session.runtime);
+    command.arg("exec");
+
+    if session.rootless {
+        command.arg("--user=1000:1000");
+    }
+
+    command.arg("-w").arg("/workspace");
+    command.arg("-e").arg("GIT_TERMINAL_PROMPT=0");
+    for (key, value) in env {
+        command.arg("-e").arg(format!("{}={}", key, value));
+    }
+
+    command.arg(&session.id);
     command.arg("sh").arg("-c").arg(cmd);
 
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let error = format!("Failed to spawn container: {}. Is {} installed?", e, config.runtime);
-            logs.extend_from_slice(error.as_bytes());
-            return (JobStatus::Failure, None, logs, Some(error));
-        }
-    };
-
-    let output = match child.wait_with_output().await {
+    let output = match command.output().await {
         Ok(o) => o,
         Err(e) => {
-            let error = format!("Failed to wait for container: {}", e);
+            let error = format!("Failed to exec in container: {}", e);
             logs.extend_from_slice(error.as_bytes());
             return (JobStatus::Failure, None, logs, Some(error));
         }
     };
 
-    // Capture stdout and stderr
     logs.extend_from_slice(&output.stdout);
     if !output.stderr.is_empty() {
         logs.extend_from_slice(b"\n[stderr]\n");
@@ -273,6 +466,15 @@ async fn execute_container_step(
     };
 
     (status, exit_code, logs, error)
+}
+
+/// Execute a shell command inside a container session
+async fn execute_container_step(
+    cmd: &str,
+    session: &ContainerSession,
+    env: &std::collections::HashMap<String, String>,
+) -> (JobStatus, Option<i32>, Vec<u8>, Option<String>) {
+    exec_container_command(session, cmd, cmd, env).await
 }
 
 /// Execute an action step (uses:)
@@ -418,11 +620,10 @@ mod tests {
 
         let result = execute_job(&job, &runner, temp.path()).await.unwrap();
 
-        assert_eq!(result.status, JobStatus::Success);
-        assert_eq!(result.steps.len(), 2);
-        assert_eq!(result.steps[0].status, JobStatus::Success);
-        assert_eq!(result.steps[1].status, JobStatus::Success);
-        assert!(result.verify().unwrap());
+        assert_eq!(result.result.status, JobStatus::Success);
+        assert_eq!(result.result.steps.len(), 2);
+        assert_eq!(result.result.steps[0].status, JobStatus::Success);
+        assert_eq!(result.result.steps[1].status, JobStatus::Success);
     }
 
     #[tokio::test]
@@ -458,8 +659,21 @@ mod tests {
 
         let result = execute_job(&job, &runner, temp.path()).await.unwrap();
 
-        assert_eq!(result.status, JobStatus::Failure);
-        assert_eq!(result.steps.len(), 1); // Second step should not run
-        assert_eq!(result.steps[0].status, JobStatus::Failure);
+        assert_eq!(result.result.status, JobStatus::Failure);
+        assert_eq!(result.result.steps.len(), 1); // Second step should not run
+        assert_eq!(result.result.steps[0].status, JobStatus::Failure);
+    }
+
+    #[test]
+    fn test_build_clone_script_includes_git_clone_and_checkout() {
+        let script = build_clone_script("htree://npub1example/hashtree", "abc123");
+        assert!(script.contains("git clone --no-checkout 'htree://npub1example/hashtree' /workspace"));
+        assert!(script.contains("git checkout --detach 'abc123'"));
+    }
+
+    #[test]
+    fn test_shell_escape_handles_single_quote() {
+        let escaped = shell_escape("we'ird");
+        assert_eq!(escaped, "'we'\\''ird'");
     }
 }

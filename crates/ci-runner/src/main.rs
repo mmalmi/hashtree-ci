@@ -267,8 +267,8 @@ async fn run_ci(
     }
 
     // Determine repo identity
-    let owner = owner_npub.unwrap_or_else(|| "local".to_string());
-    let path = repo_path.unwrap_or_else(|| {
+    let owner = owner_npub.clone().unwrap_or_else(|| "local".to_string());
+    let path = repo_path.clone().unwrap_or_else(|| {
         repo_dir
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -285,6 +285,12 @@ async fn run_ci(
     println!("  Owner: {}", owner);
     println!("  Path: {}", path);
     println!("  Commit: {}", commit_sha);
+
+    let git_url = if container_config.enabled {
+        Some(resolve_git_url(&repo_dir, owner_npub.as_deref(), repo_path.as_deref())?)
+    } else {
+        None
+    };
 
     // Find workflows
     let workflows_dir = repo_dir.join(".github/workflows");
@@ -348,7 +354,14 @@ async fn run_ci(
             }
 
             // Execute with container isolation if configured
-            let execution = executor::execute_job_with_container(&job, &runner, &repo_dir, container_config).await?;
+            let execution = executor::execute_job_with_container(
+                &job,
+                &runner,
+                &repo_dir,
+                container_config,
+                git_url.as_deref(),
+            )
+            .await?;
             let result = &execution.result;
 
             println!("    Status: {:?}", result.status);
@@ -609,6 +622,8 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
                     &workflow_path,
                 );
 
+                let git_url = format!("htree://{}/{}", update.owner_npub, update.path);
+
                 for job in jobs {
                     println!("    Job: {}", job.job_name);
 
@@ -624,9 +639,9 @@ async fn run_daemon(bind: &str) -> anyhow::Result<()> {
                         &runner,
                         &repo_dir,
                         &container_config,
+                        Some(git_url.as_str()),
                     )
-                    .await
-                    {
+                    .await {
                         Ok(r) => r,
                         Err(e) => {
                             println!("      Error: {}", e);
@@ -756,6 +771,34 @@ fn get_git_head(repo_dir: &PathBuf) -> anyhow::Result<String> {
     }
 
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+fn resolve_git_url(
+    repo_dir: &PathBuf,
+    owner_npub: Option<&str>,
+    repo_path: Option<&str>,
+) -> anyhow::Result<String> {
+    if let (Some(owner), Some(path)) = (owner_npub, repo_path) {
+        return Ok(format!("htree://{}/{}", owner, path));
+    }
+
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo_dir)
+        .output()?;
+
+    if output.status.success() {
+        let url = String::from_utf8(output.stdout)?.trim().to_string();
+        if !url.is_empty() {
+            return Ok(url);
+        }
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::bail!(
+        "Could not resolve git URL (set --owner-npub/--repo-path or configure origin): {}",
+        stderr.trim()
+    );
 }
 
 /// Add a repository to watch for updates
