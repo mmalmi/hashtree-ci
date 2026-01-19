@@ -62,6 +62,37 @@ fn finalize_job_result(result: &mut JobResult, job_failed: bool, all_logs: &[u8]
     result.logs_hash = hex::encode(sha2::Sha256::digest(all_logs));
 }
 
+fn resolve_host_work_dir(base_dir: &Path, working_directory: Option<&str>) -> std::path::PathBuf {
+    match working_directory {
+        Some(dir) => {
+            let path = Path::new(dir);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                base_dir.join(path)
+            }
+        }
+        None => base_dir.to_path_buf(),
+    }
+}
+
+fn resolve_container_work_dir(working_directory: Option<&str>) -> String {
+    match working_directory {
+        Some(dir) => {
+            let path = Path::new(dir);
+            if path.is_absolute() {
+                dir.to_string()
+            } else {
+                Path::new("/workspace")
+                    .join(path)
+                    .to_string_lossy()
+                    .to_string()
+            }
+        }
+        None => "/workspace".to_string(),
+    }
+}
+
 fn shell_escape(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -186,7 +217,7 @@ pub async fn execute_job_with_container(
         let setup_script = build_clone_script(git_url, &job.commit);
         let display_cmd = format!("container setup (clone {})", git_url);
         let (status, exit_code, logs, error) =
-            exec_container_command(&session, &setup_script, &display_cmd, &job.env).await;
+            exec_container_command(&session, &setup_script, &display_cmd, None, &job.env).await;
         if status == JobStatus::Failure {
             record_step_result(
                 &mut result,
@@ -210,12 +241,16 @@ pub async fn execute_job_with_container(
     for step in &job.steps {
         let step_start = std::time::Instant::now();
 
+        let mut step_env = job.env.clone();
+        step_env.extend(step.env.clone());
+        let working_directory = step.working_directory.as_deref();
+
         let (status, exit_code, logs, error) = match &step.action {
             StepAction::Run(cmd) => {
                 if let Some(ref session) = container_session {
-                    execute_container_step(cmd, session, &job.env).await
+                    execute_container_step(cmd, working_directory, session, &step_env).await
                 } else {
-                    execute_shell_step(cmd, work_dir, &job.env).await
+                    execute_shell_step(cmd, work_dir, working_directory, &step_env).await
                 }
             }
             StepAction::Uses { action, with } => {
@@ -256,6 +291,7 @@ pub async fn execute_job_with_container(
 async fn execute_shell_step(
     cmd: &str,
     work_dir: &Path,
+    working_directory: Option<&str>,
     env: &std::collections::HashMap<String, String>,
 ) -> (JobStatus, Option<i32>, Vec<u8>, Option<String>) {
     let mut logs = Vec::new();
@@ -264,10 +300,11 @@ async fn execute_shell_step(
     logs.extend_from_slice(format!("$ {}\n", cmd).as_bytes());
 
     let mut command = Command::new("sh");
+    let current_dir = resolve_host_work_dir(work_dir, working_directory);
     command
         .arg("-c")
         .arg(cmd)
-        .current_dir(work_dir)
+        .current_dir(current_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -412,6 +449,7 @@ async fn exec_container_command(
     session: &ContainerSession,
     cmd: &str,
     display_cmd: &str,
+    working_directory: Option<&str>,
     env: &std::collections::HashMap<String, String>,
 ) -> (JobStatus, Option<i32>, Vec<u8>, Option<String>) {
     let mut logs = Vec::new();
@@ -426,8 +464,24 @@ async fn exec_container_command(
         command.arg("--user=1000:1000");
     }
 
-    command.arg("-w").arg("/workspace");
+    let work_dir = resolve_container_work_dir(working_directory);
+    command.arg("-w").arg(work_dir);
     command.arg("-e").arg("GIT_TERMINAL_PROMPT=0");
+    if !env.contains_key("HTREE_DATA_DIR") {
+        command.arg("-e").arg("HTREE_DATA_DIR=/workspace/.hashtree-data");
+    }
+    if !env.contains_key("HTREE_CONFIG_DIR") {
+        command.arg("-e").arg("HTREE_CONFIG_DIR=/home/node/.hashtree");
+    }
+    if !env.contains_key("XDG_CACHE_HOME") {
+        command.arg("-e").arg("XDG_CACHE_HOME=/tmp/.cache");
+    }
+    if !env.contains_key("PNPM_STORE_PATH") {
+        command.arg("-e").arg("PNPM_STORE_PATH=/workspace/.pnpm-store");
+    }
+    if !env.contains_key("PNPM_HOME") {
+        command.arg("-e").arg("PNPM_HOME=/workspace/.pnpm-home");
+    }
     for (key, value) in env {
         command.arg("-e").arg(format!("{}={}", key, value));
     }
@@ -471,10 +525,11 @@ async fn exec_container_command(
 /// Execute a shell command inside a container session
 async fn execute_container_step(
     cmd: &str,
+    working_directory: Option<&str>,
     session: &ContainerSession,
     env: &std::collections::HashMap<String, String>,
 ) -> (JobStatus, Option<i32>, Vec<u8>, Option<String>) {
-    exec_container_command(session, cmd, cmd, env).await
+    exec_container_command(session, cmd, cmd, working_directory, env).await
 }
 
 /// Execute an action step (uses:)
@@ -569,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_simple_command() {
         let (status, exit_code, logs, error) =
-            execute_shell_step("echo 'hello world'", Path::new("/tmp"), &HashMap::new()).await;
+            execute_shell_step("echo 'hello world'", Path::new("/tmp"), None, &HashMap::new()).await;
 
         assert_eq!(status, JobStatus::Success);
         assert_eq!(exit_code, Some(0));
@@ -580,7 +635,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_failing_command() {
         let (status, exit_code, _logs, error) =
-            execute_shell_step("exit 1", Path::new("/tmp"), &HashMap::new()).await;
+            execute_shell_step("exit 1", Path::new("/tmp"), None, &HashMap::new()).await;
 
         assert_eq!(status, JobStatus::Failure);
         assert_eq!(exit_code, Some(1));

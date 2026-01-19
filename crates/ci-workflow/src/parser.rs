@@ -11,6 +11,8 @@ pub struct Workflow {
     pub on: WorkflowTrigger,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub defaults: Option<WorkflowDefaults>,
     pub jobs: HashMap<String, WorkflowJob>,
 }
 
@@ -74,6 +76,19 @@ pub struct WorkflowStep {
     pub timeout_minutes: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WorkflowDefaults {
+    #[serde(default)]
+    pub run: Option<WorkflowRunDefaults>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowRunDefaults {
+    #[serde(rename = "working-directory")]
+    pub working_directory: Option<String>,
+    pub shell: Option<String>,
+}
+
 /// Parse a workflow YAML file
 pub fn parse_workflow(yaml: &str) -> anyhow::Result<Workflow> {
     Ok(serde_yaml::from_str(yaml)?)
@@ -86,6 +101,12 @@ pub fn workflow_to_jobs(
     commit: &str,
     workflow_path: &str,
 ) -> Vec<Job> {
+    let default_working_directory = workflow
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.run.as_ref())
+        .and_then(|run| run.working_directory.clone());
+
     workflow
         .jobs
         .iter()
@@ -125,7 +146,10 @@ pub fn workflow_to_jobs(
                     JobStep {
                         name,
                         action,
-                        working_directory: step.working_directory.clone(),
+                        working_directory: step
+                            .working_directory
+                            .clone()
+                            .or_else(|| default_working_directory.clone()),
                         env: step.env.clone(),
                         continue_on_error: step.continue_on_error,
                         timeout_minutes: step.timeout_minutes,
@@ -164,5 +188,25 @@ jobs:
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_name, "build");
         assert_eq!(jobs[0].steps.len(), 2);
+    }
+
+    #[test]
+    fn test_defaults_working_directory_applied() {
+        let yaml = r#"
+name: CI
+on: push
+defaults:
+  run:
+    working-directory: ts
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build
+        run: pnpm install
+"#;
+        let workflow = parse_workflow(yaml).unwrap();
+        let jobs = workflow_to_jobs(&workflow, "htree://abc", "abc123", ".github/workflows/ci.yml");
+        assert_eq!(jobs[0].steps[0].working_directory.as_deref(), Some("ts"));
     }
 }
